@@ -31,13 +31,14 @@ print("="*60)
 """========== 参数配置 =========="""
 
 """输出路径配置"""
-taskNum = 'construction_world2'
+taskNum = 'construction_world2_v3'  # v3：改进点云采集同步
 path_dir_root = "/home/xander/partime/ConstructionScenePoseEstimation"
 path_dir_dataset = f"{path_dir_root}/dataset_{taskNum}"
 path_dir_rgb = f"{path_dir_dataset}/rgb"
 path_dir_depth = f"{path_dir_dataset}/depth"
 path_dir_pointcloud = f"{path_dir_dataset}/pointcloud"
 path_dir_label = f"{path_dir_dataset}/labels"
+path_dir_logs = f"{path_dir_dataset}/logs"
 
 """场景参数"""
 # 相机参数
@@ -46,27 +47,274 @@ img_width = 1280
 img_height = 720
 
 # 相机位置范围（用于随机采样）
-cam_distance_range = [8.0, 15.0]  # 距离中心的距离范围
-cam_height_range = [2.0, 6.0]     # 相机高度范围
-cam_angle_range = [0, 360]        # 水平角度范围
+# 场景包围盒: 50x50x8米, 中心[0,0,3.7]
+cam_distance_range = [15.0, 30.0]   # 距离中心15-30米（平衡距离和质量）
+cam_height_range = [2.0, 6.0]       # 相机高度2-6米（扩大范围增加多样性）
+cam_angle_range = [0, 360]          # 水平角度范围
 
 # 目标瞄准点（场景中心）
-aimed_point = np.array([0, 0, 1.5])
+# 注意：在采样时会动态调整为与相机相同的高度，保持水平拍摄
+
+# 数据质量控制
+min_pointcloud_points = 100   # 最小点云点数阈值
+max_retry_per_frame = 5       # 每帧最大重试次数（降低以加快生成）
+enable_pointcloud_validation = False  # 禁用验证，先采集所有数据
 
 """数据集参数"""
-max_iterations = 100  # 生成的总帧数
+max_iterations = 20  # 生成的总帧数（快速测试）
 current_iter = 0
 
 """物体类别定义（根据world2.usd场景中的物体调整）"""
+# 根据场景诊断结果更新：实际场景中有box(22个)和tree(109个)
 construction_class = {
-    "crane": 0,
-    "dumper": 1,
-    "fence": 2,
-    "tree": 3,
-    "trafficcone": 4,
-    "people": 5,
+    "box": 0,           # 场景中有22个box
+    "tree": 1,          # 场景中有109个tree
+    "cone": 2,          # 可能有锥形物体
+    "fence": 3,         # 可能有围栏（fencing）
+    "fencing": 3,       # 围栏的另一个名称
+    "construction": 4,  # 施工相关物体
+    "human": 5,         # 人物
+    "dhgen": 5,         # 人物模型（DHGen）
     # 可根据实际场景添加更多类别
 }
+
+"""========== 日志记录类 =========="""
+
+class DataQualityLogger:
+    """数据质量日志记录器"""
+    def __init__(self, log_dir):
+        self.log_dir = log_dir
+        os.makedirs(log_dir, exist_ok=True)
+        
+        self.frame_logs = []
+        self.statistics = {
+            "total_frames_attempted": 0,
+            "successful_frames": 0,
+            "failed_frames": 0,
+            "retry_count": 0,
+            "pointcloud_stats": {"valid": 0, "empty": 0, "insufficient": 0},
+            "rgb_stats": {"valid": 0, "failed": 0},
+            "depth_stats": {"valid": 0, "failed": 0, "all_zero": 0, "all_inf": 0},
+            "label_stats": {"valid": 0, "empty": 0},
+            "object_count": {"total": 0, "per_frame_avg": 0}
+        }
+        
+        # 创建详细日志文件
+        timestamp = Path(log_dir).parent.name
+        self.detail_log_path = f"{log_dir}/generation_detail.log"
+        self.summary_log_path = f"{log_dir}/generation_summary.json"
+        
+        with open(self.detail_log_path, 'w', encoding='utf-8') as f:
+            f.write(f"=== 数据生成详细日志 ===\n")
+            f.write(f"开始时间: {timestamp}\n\n")
+    
+    def log_frame_start(self, frame_id, cam_pos):
+        """记录帧开始"""
+        msg = f"\n{'='*60}\n帧 {frame_id} 开始采集\n相机位置: {cam_pos}\n"
+        self._write_log(msg)
+        
+        self.current_frame = {
+            "frame_id": frame_id,
+            "camera_position": cam_pos.tolist() if hasattr(cam_pos, 'tolist') else cam_pos,
+            "retry_count": 0,
+            "status": "processing",
+            "issues": []
+        }
+    
+    def log_retry(self, retry_count):
+        """记录重试"""
+        self.current_frame["retry_count"] = retry_count
+        self.statistics["retry_count"] += 1
+        msg = f"  ⚠ 重试 {retry_count} 次\n"
+        self._write_log(msg)
+    
+    def log_pointcloud(self, valid, point_count=0, reason=""):
+        """记录点云状态"""
+        if valid:
+            self.statistics["pointcloud_stats"]["valid"] += 1
+            self.current_frame["pointcloud"] = {"status": "valid", "points": point_count}
+            msg = f"  ✓ 点云: {point_count} 个点\n"
+        else:
+            if point_count == 0:
+                self.statistics["pointcloud_stats"]["empty"] += 1
+                self.current_frame["issues"].append(f"点云为空: {reason}")
+                msg = f"  ✗ 点云为空: {reason}\n"
+            else:
+                self.statistics["pointcloud_stats"]["insufficient"] += 1
+                self.current_frame["issues"].append(f"点云不足: {point_count} 点")
+                msg = f"  ✗ 点云不足: {point_count} 点 ({reason})\n"
+        self._write_log(msg)
+    
+    def log_rgb(self, valid, reason=""):
+        """记录RGB图像状态"""
+        if valid:
+            self.statistics["rgb_stats"]["valid"] += 1
+            self.current_frame["rgb"] = {"status": "valid"}
+            msg = f"  ✓ RGB图像采集成功\n"
+        else:
+            self.statistics["rgb_stats"]["failed"] += 1
+            self.current_frame["issues"].append(f"RGB失败: {reason}")
+            msg = f"  ✗ RGB图像失败: {reason}\n"
+        self._write_log(msg)
+    
+    def log_depth(self, valid, depth_data=None, reason=""):
+        """记录深度图状态"""
+        if valid and depth_data is not None:
+            # 检查深度数据质量
+            valid_pixels = np.sum(np.isfinite(depth_data) & (depth_data > 0))
+            total_pixels = depth_data.size
+            zero_pixels = np.sum(depth_data == 0)
+            inf_pixels = np.sum(np.isinf(depth_data))
+            
+            # 修复：检查是否有有效数据
+            valid_depth = depth_data[np.isfinite(depth_data) & (depth_data > 0)]
+            if len(valid_depth) > 0:
+                depth_min = np.min(valid_depth)
+                depth_max = np.max(valid_depth)
+                depth_mean = np.mean(valid_depth)
+            else:
+                depth_min = depth_max = depth_mean = 0.0
+            
+            self.current_frame["depth"] = {
+                "status": "valid",
+                "valid_pixels": int(valid_pixels),
+                "total_pixels": int(total_pixels),
+                "valid_ratio": float(valid_pixels / total_pixels),
+                "zero_pixels": int(zero_pixels),
+                "inf_pixels": int(inf_pixels),
+                "depth_range": [float(depth_min), float(depth_max)],
+                "depth_mean": float(depth_mean)
+            }
+            
+            if zero_pixels == total_pixels:
+                self.statistics["depth_stats"]["all_zero"] += 1
+                self.current_frame["issues"].append("深度图全为零")
+                msg = f"  ⚠ 深度图: 全为零值！\n"
+            elif inf_pixels == total_pixels:
+                self.statistics["depth_stats"]["all_inf"] += 1
+                self.current_frame["issues"].append("深度图全为无穷")
+                msg = f"  ⚠ 深度图: 全为无穷值！\n"
+            else:
+                self.statistics["depth_stats"]["valid"] += 1
+                msg = f"  ✓ 深度图: 有效像素 {valid_pixels}/{total_pixels} ({100*valid_pixels/total_pixels:.1f}%)\n"
+                msg += f"    深度范围: [{depth_min:.2f}, {depth_max:.2f}] 平均: {depth_mean:.2f}\n"
+        else:
+            self.statistics["depth_stats"]["failed"] += 1
+            self.current_frame["issues"].append(f"深度图失败: {reason}")
+            msg = f"  ✗ 深度图失败: {reason}\n"
+        self._write_log(msg)
+    
+    def log_labels(self, object_count):
+        """记录标签状态"""
+        if object_count > 0:
+            self.statistics["label_stats"]["valid"] += 1
+            self.statistics["object_count"]["total"] += object_count
+            self.current_frame["labels"] = {"status": "valid", "object_count": object_count}
+            msg = f"  ✓ 标签: {object_count} 个物体\n"
+        else:
+            self.statistics["label_stats"]["empty"] += 1
+            self.current_frame["issues"].append("未识别到物体")
+            msg = f"  ⚠ 标签: 0 个物体（可能视野外或未匹配类别）\n"
+        self._write_log(msg)
+    
+    def log_frame_end(self, success):
+        """记录帧结束"""
+        self.statistics["total_frames_attempted"] += 1
+        if success:
+            self.statistics["successful_frames"] += 1
+            self.current_frame["status"] = "success"
+            msg = f">>> 帧 {self.current_frame['frame_id']} 完成 ✓\n"
+        else:
+            self.statistics["failed_frames"] += 1
+            self.current_frame["status"] = "failed"
+            msg = f">>> 帧 {self.current_frame['frame_id']} 失败 ✗\n"
+        
+        self._write_log(msg)
+        self.frame_logs.append(self.current_frame.copy())
+    
+    def save_summary(self):
+        """保存汇总报告"""
+        # 计算平均值
+        if self.statistics["successful_frames"] > 0:
+            self.statistics["object_count"]["per_frame_avg"] = \
+                self.statistics["object_count"]["total"] / self.statistics["successful_frames"]
+        
+        # 成功率
+        self.statistics["success_rate"] = \
+            self.statistics["successful_frames"] / max(1, self.statistics["total_frames_attempted"])
+        
+        # 保存JSON汇总
+        summary_data = {
+            "statistics": self.statistics,
+            "frame_logs": self.frame_logs
+        }
+        
+        with open(self.summary_log_path, 'w', encoding='utf-8') as f:
+            json.dump(summary_data, f, indent=2, ensure_ascii=False)
+        
+        # 生成可读报告
+        report = self._generate_report()
+        with open(self.detail_log_path, 'a', encoding='utf-8') as f:
+            f.write(f"\n\n{'='*60}\n")
+            f.write(report)
+        
+        print(f"\n日志已保存:")
+        print(f"  详细日志: {self.detail_log_path}")
+        print(f"  汇总JSON: {self.summary_log_path}")
+        return report
+    
+    def _generate_report(self):
+        """生成可读报告"""
+        stats = self.statistics
+        report = "=== 数据生成汇总报告 ===\n\n"
+        
+        report += f"总体统计:\n"
+        report += f"  尝试帧数: {stats['total_frames_attempted']}\n"
+        report += f"  成功帧数: {stats['successful_frames']}\n"
+        report += f"  失败帧数: {stats['failed_frames']}\n"
+        report += f"  成功率: {stats['success_rate']*100:.1f}%\n"
+        report += f"  总重试次数: {stats['retry_count']}\n\n"
+        
+        report += f"点云质量:\n"
+        report += f"  有效: {stats['pointcloud_stats']['valid']}\n"
+        report += f"  为空: {stats['pointcloud_stats']['empty']}\n"
+        report += f"  不足: {stats['pointcloud_stats']['insufficient']}\n\n"
+        
+        report += f"RGB图像:\n"
+        report += f"  成功: {stats['rgb_stats']['valid']}\n"
+        report += f"  失败: {stats['rgb_stats']['failed']}\n\n"
+        
+        report += f"深度图:\n"
+        report += f"  有效: {stats['depth_stats']['valid']}\n"
+        report += f"  失败: {stats['depth_stats']['failed']}\n"
+        report += f"  全零: {stats['depth_stats']['all_zero']}\n"
+        report += f"  全无穷: {stats['depth_stats']['all_inf']}\n\n"
+        
+        report += f"标签识别:\n"
+        report += f"  有效: {stats['label_stats']['valid']}\n"
+        report += f"  为空: {stats['label_stats']['empty']}\n"
+        report += f"  总物体数: {stats['object_count']['total']}\n"
+        report += f"  平均每帧: {stats['object_count']['per_frame_avg']:.2f}\n\n"
+        
+        # 常见问题分析
+        report += f"常见问题:\n"
+        issue_count = {}
+        for frame in self.frame_logs:
+            for issue in frame.get("issues", []):
+                issue_type = issue.split(":")[0]
+                issue_count[issue_type] = issue_count.get(issue_type, 0) + 1
+        
+        for issue_type, count in sorted(issue_count.items(), key=lambda x: x[1], reverse=True):
+            report += f"  {issue_type}: {count} 次\n"
+        
+        return report
+    
+    def _write_log(self, msg):
+        """写入日志文件"""
+        with open(self.detail_log_path, 'a', encoding='utf-8') as f:
+            f.write(msg)
+        print(msg, end='')
+
 
 """========== 工具函数 =========="""
 
@@ -105,23 +353,46 @@ def rotMtx2quaternion(R):
 def camPosOri(target_point, aimed_point):
     """
     计算相机朝向目标点的姿态（四元数）
-    使用 task3.py 中验证过的方法
+    强制相机始终保持正向（up vector = [0, 0, 1]）
     Input: 
         target_point: 相机位置 (3,)
         aimed_point: 目标瞄准点 (3,)
     Output: 
         q: 四元数 (w, x, y, z)
     """
-    x2 = (aimed_point - target_point) / np.linalg.norm(aimed_point - target_point)
-    x1 = np.array([-1, 0, 0])
-    y1 = np.array([0, -1, 0])
-    z1 = np.array([0, 0, 1])
-    y2 = np.array([- x1[1]/(np.sqrt(x1[0]**2 + x1[1]**2)), x1[0]/(np.sqrt(x1[0]**2 + x1[1]**2)), 0])
-    z2 = np.cross(x2, y2)
-    R_1to2 = np.linalg.inv(np.vstack((x2, y2, z2)).T) @ (np.vstack((x1, y1, z1)).T)
-    R_0to1 = np.array([[-1, 0, 0], [0, -1, 0], [0, 0, 1]])
-    R = R_1to2 @ R_0to1
-    q = rotMtx2quaternion(R)
+    # 计算相机的forward方向（指向目标）
+    forward = aimed_point - target_point
+    forward = forward / np.linalg.norm(forward)
+    
+    # 世界坐标系的up方向
+    world_up = np.array([0.0, 0.0, 1.0])
+    
+    # 计算相机的right方向（forward × world_up）
+    right = np.cross(forward, world_up)
+    right_norm = np.linalg.norm(right)
+    
+    # 如果forward和world_up几乎平行，使用备用方案
+    if right_norm < 1e-6:
+        # 相机几乎垂直向上或向下，使用备用轴
+        right = np.array([1.0, 0.0, 0.0])
+    else:
+        right = right / right_norm
+    
+    # 重新计算相机的up方向（right × forward）
+    up = np.cross(right, forward)
+    up = up / np.linalg.norm(up)
+    
+    # 构建旋转矩阵（相机坐标系 -> 世界坐标系）
+    # Isaac Sim相机默认朝向-X轴，up是+Z轴
+    # 世界坐标系: forward对应相机-X, right对应相机-Y, up对应相机+Z
+    R_camera_to_world = np.array([
+        [-forward[0], -right[0], up[0]],
+        [-forward[1], -right[1], up[1]],
+        [-forward[2], -right[2], up[2]]
+    ])
+    
+    # 转换为四元数
+    q = rotMtx2quaternion(R_camera_to_world)
     return q
 
 
@@ -188,6 +459,97 @@ def save_label_json(label_dict, filename):
         json.dump(label_dict, f, indent=2, ensure_ascii=False)
 
 
+def depth_to_pointcloud_with_rgb(depth_data, rgb_image, camera_params, camera_pose):
+    """
+    从深度图和RGB图像生成点云（后备方案）
+    
+    当pointcloud annotator返回空数据时使用此方法
+    
+    参数:
+        depth_data: 深度图 (H, W)
+        rgb_image: RGB图像 (H, W, 3) 或 (H, W, 4)
+        camera_params: 相机参数字典，包含 horizontal_aperture, vertical_aperture, focal_length, width, height
+        camera_pose: 相机位姿 (7,) [x,y,z,qx,qy,qz,qw]
+    
+    返回:
+        点云数组 (N, 6) [x, y, z, r, g, b] 或 None
+    """
+    try:
+        h, w = depth_data.shape
+        
+        # 提取相机内参
+        # 从相机参数计算内参矩阵
+        focal_length = camera_params.get('focal_length', 18.14)
+        horizontal_aperture = camera_params.get('horizontal_aperture', 20.955)
+        vertical_aperture = camera_params.get('vertical_aperture', 15.2908)
+        img_width = camera_params.get('width', w)
+        img_height = camera_params.get('height', h)
+        
+        # 计算焦距（像素单位）
+        # fx = (focal_length / horizontal_aperture) * img_width
+        # fy = (focal_length / vertical_aperture) * img_height
+        # 更准确的计算方式
+        fx = (img_width * focal_length) / horizontal_aperture
+        fy = (img_height * focal_length) / vertical_aperture
+        cx = img_width / 2.0
+        cy = img_height / 2.0
+        
+        # 生成像素坐标网格
+        u, v = np.meshgrid(np.arange(w), np.arange(h))
+        
+        # 过滤有效深度值
+        valid_mask = np.isfinite(depth_data) & (depth_data > 0) & (depth_data < 250)
+        
+        if not valid_mask.any():
+            print(f"  ⚠ 无有效深度值用于生成点云")
+            return None
+        
+        # 计算相机坐标系下的3D坐标
+        z = depth_data[valid_mask]
+        x = (u[valid_mask] - cx) * z / fx
+        y = (v[valid_mask] - cy) * z / fy
+        
+        # 相机坐标系下的点云 (OpenGL坐标系: -Z forward, Y up)
+        # Isaac Sim使用右手坐标系，相机朝向-X，需要转换
+        points_camera = np.stack([x, y, z], axis=-1)
+        
+        # 转换到世界坐标系
+        position = np.array(camera_pose[:3])
+        quaternion = np.array(camera_pose[3:])  # [qx, qy, qz, qw]
+        
+        # 四元数转旋转矩阵
+        rotation = R.from_quat(quaternion).as_matrix()
+        
+        # 应用变换：points_world = R @ points_camera.T + position
+        points_world = (rotation @ points_camera.T).T + position
+        
+        # 获取对应的RGB值
+        if rgb_image is not None and rgb_image.size > 0:
+            # 确保RGB图像是3通道
+            if rgb_image.shape[2] >= 3:
+                rgb = rgb_image[valid_mask, :3]
+                # 如果RGB值在[0,1]范围，转换为[0,255]
+                if rgb.max() <= 1.0:
+                    rgb = (rgb * 255).astype(np.uint8)
+                else:
+                    rgb = rgb.astype(np.uint8)
+            else:
+                rgb = np.ones((points_world.shape[0], 3), dtype=np.uint8) * 255
+        else:
+            rgb = np.ones((points_world.shape[0], 3), dtype=np.uint8) * 255
+        
+        # 合并为 (N, 6)
+        xyzrgb = np.hstack([points_world, rgb])
+        
+        return xyzrgb
+        
+    except Exception as e:
+        print(f"  ✗ 从深度图生成点云失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 def save_pointcloud_with_rgb(pcd_data, filename):
     """
     保存点云数据（XYZ + RGB）
@@ -246,34 +608,86 @@ def save_pointcloud_with_rgb(pcd_data, filename):
         np.savetxt(filename, xyzrgb, fmt='%.6f', delimiter=' ', 
                    header='x y z r g b', comments='')
         
-        print(f"  ✓ 点云: {xyzrgb.shape[0]} 个点 -> {filename}")
-        
     except Exception as e:
-        print(f"  ✗ 保存点云失败: {e}")
+        print(f"  ✗ 保存点云异常: {e}")
         import traceback
         traceback.print_exc()
 
 
-def sample_camera_position(distance_range, height_range, angle_range):
+def get_systematic_camera_positions(num_frames=20):
     """
-    随机采样相机位置
+    网格化采样策略：在场景内均匀分布相机
+    
+    策略：
+    1. 将场景划分为网格
+    2. 在每个网格位置放置相机
+    3. 相机朝不同方向拍摄（水平转动）
+    4. 确保覆盖整个场景
+    
+    返回：[(cam_pos, target_pos), ...]
     """
-    distance = np.random.uniform(distance_range[0], distance_range[1])
-    height = np.random.uniform(height_range[0], height_range[1])
-    angle = np.deg2rad(np.random.uniform(angle_range[0], angle_range[1]))
+    positions = []
     
-    x = distance * np.cos(angle)
-    y = distance * np.sin(angle)
-    z = height
+    # 根据分析：物体主要集中在场景左侧和中心区域
+    # 调整采样范围到物体密集区
     
-    return np.array([x, y, z])
+    heights = [1.6, 1.7, 1.8]
+    frame_count = 0
+    
+    # 策略1: 在物体密集区（左侧和中心）采样
+    # 根据分析，最佳位置在 x=[-10, 0], y=[-8, 8]
+    dense_positions = [
+        # 中心区域（物体最密集）
+        ([-3, -3], [0, 0]),    # 中心偏左下
+        ([-3, 3], [0, 0]),     # 中心偏左上
+        ([0, 0], [5, 0]),      # 正中心看右
+        ([0, 0], [-5, 0]),     # 正中心看左
+        
+        # 左侧区域
+        ([-8, -3], [0, 0]),    # 左侧看中心
+        ([-8, 3], [0, 0]),     # 左侧看中心
+        ([-5, -8], [0, 0]),    # 左下角看中心
+        ([-5, 8], [0, 0]),     # 左上角看中心
+        
+        # 环绕中心
+        ([6, 0], [0, 0]),      # 右侧看中心
+        ([0, 6], [0, 0]),      # 上方看中心
+        ([0, -6], [0, 0]),     # 下方看中心
+        ([-6, 0], [0, 0]),     # 左侧看中心
+        
+        # 对角线
+        ([5, 5], [0, 0]),      # 右上看中心
+        ([5, -5], [0, 0]),     # 右下看中心
+        ([-5, 5], [0, 0]),     # 左上看中心
+        ([-5, -5], [0, 0]),    # 左下看中心
+        
+        # 更近距离
+        ([3, 0], [0, 0]),      # 近距离右侧
+        ([-3, 0], [0, 0]),     # 近距离左侧
+        ([0, 3], [0, 0]),      # 近距离上方
+        ([0, -3], [0, 0]),     # 近距离下方
+    ]
+    
+    for i, (cam_xy, target_xy) in enumerate(dense_positions):
+        if frame_count >= num_frames:
+            break
+        
+        cam_z = heights[frame_count % len(heights)]
+        cam_position = np.array([cam_xy[0], cam_xy[1], cam_z])
+        target_point = np.array([target_xy[0], target_xy[1], cam_z])
+        
+        positions.append((cam_position, target_point))
+        frame_count += 1
+    
+    print(f"[调试] 实际生成了 {len(positions)} 个相机位置（请求: {num_frames}）")
+    return positions
 
 
 """========== 准备工作 =========="""
 
 # 创建输出目录
 for dir_path in [path_dir_dataset, path_dir_rgb, path_dir_depth, 
-                 path_dir_pointcloud, path_dir_label]:
+                 path_dir_pointcloud, path_dir_label, path_dir_logs]:
     if not os.path.exists(dir_path):
         os.makedirs(dir_path)
         print(f"创建目录: {dir_path}")
@@ -307,6 +721,27 @@ async def generate_data():
     print("开始数据生成")
     print("="*60)
     
+    # 初始化日志记录器
+    logger = DataQualityLogger(path_dir_logs)
+    print(f"日志记录器已初始化: {path_dir_logs}")
+    print(f"⚠ 点云验证: {'启用' if enable_pointcloud_validation else '禁用（诊断模式）'}")
+    
+    # 场景检查
+    print(f"\n[诊断] 场景信息:")
+    prim_count = len(list(stage.Traverse()))
+    print(f"  Stage总Primitives数: {prim_count}")
+    
+    world_prim = stage.GetPrimAtPath("/World")
+    if world_prim:
+        world_children = list(world_prim.GetChildren())
+        print(f"  /World下的子对象数: {len(world_children)}")
+        if len(world_children) > 0:
+            print(f"  前5个子对象:")
+            for child in world_children[:5]:
+                print(f"    - {child.GetPath()} ({child.GetTypeName()})")
+    else:
+        print(f"  ⚠ /World路径不存在！")
+    
     """1. 设置相机"""
     print(f"\n[步骤1] 初始化相机...")
     camera = Camera(prim_path=camera_path, resolution=(img_width, img_height))
@@ -322,6 +757,22 @@ async def generate_data():
         prim_camera.SetActive(True)
         print(f"  激活相机: {camera_path}")
     
+    # 设置相机clipping范围（根据场景尺寸）
+    try:
+        cam_usd = UsdGeom.Camera(prim_camera)
+        cam_usd.GetClippingRangeAttr().Set((0.5, 250.0))  # near=0.5m, far=250m
+        
+        # 设置更大的视场角（FOV）
+        # 通过减小focal length或增大horizontal aperture来增大FOV
+        # 默认focal length约为18mm，减小到12mm可以获得更大视场
+        cam_usd.GetFocalLengthAttr().Set(12.0)  # 更小的焦距 = 更大的FOV
+        cam_usd.GetHorizontalApertureAttr().Set(25.0)  # 增大光圈尺寸
+        
+        print(f"  设置相机clipping范围: (0.5, 250.0)")
+        print(f"  设置相机FOV: focal_length=12mm, aperture=25mm (广角)")
+    except Exception as e:
+        print(f"  ⚠ 无法设置相机参数: {e}")
+    
     await asyncio.sleep(1)
     camera.initialize()
     await asyncio.sleep(1)
@@ -334,21 +785,28 @@ async def generate_data():
     # 深度图
     depth_annotator = AnnotatorRegistry.get_annotator("distance_to_image_plane")
     depth_annotator.attach(camera.get_render_product_path())
+    await omni.kit.app.get_app().next_update_async()
     await asyncio.sleep(0.5)
     
-    # 点云
+    # 点云（增加初始化配置）
     pcd_annotator = AnnotatorRegistry.get_annotator("pointcloud")
     pcd_annotator.attach(camera.get_render_product_path())
+    # 等待点云annotator完全初始化（点云需要更多时间）
+    await omni.kit.app.get_app().next_update_async()
+    await asyncio.sleep(1.0)
+    await omni.kit.app.get_app().next_update_async()
     await asyncio.sleep(0.5)
     
     # 实例分割
     instance_annotator = AnnotatorRegistry.get_annotator("instance_segmentation")
     instance_annotator.attach(camera.get_render_product_path())
+    await omni.kit.app.get_app().next_update_async()
     await asyncio.sleep(0.5)
     
     # 3D边界框
     bbox_3d_annotator = AnnotatorRegistry.get_annotator("bounding_box_3d")
     bbox_3d_annotator.attach(camera.get_render_product_path())
+    await omni.kit.app.get_app().next_update_async()
     await asyncio.sleep(0.5)
     
     print("  所有采集器已附加")
@@ -357,65 +815,206 @@ async def generate_data():
     print(f"\n[步骤3] 启动仿真时间线...")
     timeline = omni.timeline.get_timeline_interface()
     timeline.play()
-    await asyncio.sleep(2)
+    await asyncio.sleep(3)  # 增加等待让timeline稳定
     
     camera.add_motion_vectors_to_frame()
-    await asyncio.sleep(1)
-    print("  时间线已启动")
+    await asyncio.sleep(2)  # 增加等待让渲染管线准备好
+    print("  时间线已启动，等待渲染管线稳定...")
+    
+    # 额外等待确保第一帧渲染正常
+    await asyncio.sleep(2)
+    print("  渲染管线已就绪")
+    
+    # 预热所有annotator（测试采集）
+    print("\n[预热] 测试所有数据采集器...")
+    await omni.kit.app.get_app().next_update_async()
+    await asyncio.sleep(1.0)
+    
+    test_pcd = pcd_annotator.get_data()
+    test_rgb = camera.get_rgba()
+    test_depth = depth_annotator.get_data()
+    
+    print(f"  点云采集器: {'✓' if test_pcd is not None else '✗'}")
+    print(f"  RGB采集器: {'✓' if test_rgb is not None else '✗'}")
+    print(f"  深度采集器: {'✓' if test_depth is not None else '✗'}")
+    
+    if test_pcd is not None and 'data' in test_pcd:
+        xyz = test_pcd['data']
+        if xyz is not None and len(xyz) > 0:
+            print(f"  预热点云: {len(xyz)} 个点 ✓")
+        else:
+            print(f"  预热点云: 数据为空 ⚠")
+    else:
+        print(f"  预热点云: annotator返回None ⚠")
+    
+    print("  预热完成\n")
     
     """4. 数据采集循环"""
     print(f"\n[步骤4] 开始数据采集循环 (目标: {max_iterations} 帧)...")
     print("="*60)
     
-    while current_iter < max_iterations:
-        print(f"\n>>> 采集帧 {current_iter}/{max_iterations} <<<")
+    # 预先生成所有相机位置（系统化采样）
+    all_camera_positions = get_systematic_camera_positions(max_iterations)
+    actual_frames = len(all_camera_positions)
+    print(f"\n已生成 {actual_frames} 个系统化采样位置（请求: {max_iterations}）")
+    print("采样策略: 同心圆，从近到远覆盖场景")
+    print("="*60)
+    
+    # 重置帧计数器（修复多次运行时不重置的问题）
+    current_iter = 0
+    
+    while current_iter < actual_frames:
+        # 使用预定义的相机位置
+        cam_position, aimed_point = all_camera_positions[current_iter]
+        logger.log_frame_start(current_iter, cam_position)
         
-        """4.1 随机相机位置"""
-        cam_position = sample_camera_position(cam_distance_range, cam_height_range, cam_angle_range)
-        cam_orientation = camPosOri(cam_position, aimed_point)
+        # 重试循环：如果点云为空则微调相机位置
+        retry_count = 0
+        frame_valid = False
         
-        camera.set_world_pose(position=cam_position, orientation=cam_orientation)
-        print(f"  相机位置: {cam_position}")
-        await asyncio.sleep(2)
+        while not frame_valid and retry_count < max_retry_per_frame:
+            if retry_count > 0:
+                logger.log_retry(retry_count)
+                # 微调相机位置（添加小随机偏移）
+                offset = np.random.uniform(-2, 2, size=3)
+                offset[2] *= 0.5  # z方向偏移更小
+                cam_position_adjusted = cam_position + offset
+            else:
+                cam_position_adjusted = cam_position
+            
+            """4.1 设置相机位置"""
+            cam_orientation = camPosOri(cam_position_adjusted, aimed_point)
+            
+            camera.set_world_pose(position=cam_position_adjusted, orientation=cam_orientation)
+            if retry_count == 0:
+                print(f"  相机位置: {cam_position_adjusted}")
+                print(f"  瞄准点: {aimed_point}")
+            
+            # 等待渲染管线更新（确保所有annotator同步）
+            await omni.kit.app.get_app().next_update_async()
+            await asyncio.sleep(1.5)
+            await omni.kit.app.get_app().next_update_async()
+            await asyncio.sleep(0.5)
         
-        # 获取相机位姿
-        try:
-            cam_pose = get_obj_pose(stage, camera_path)
-        except:
-            cam_pose = list(cam_position) + [0, 0, 0, 1]
+            # 获取相机位姿
+            try:
+                cam_pose = get_obj_pose(stage, camera_path)
+            except:
+                cam_pose = list(cam_position_adjusted) + [0, 0, 0, 1]
+            
+            """4.2 预采集点云验证"""
+            # 等待渲染管线完全更新（增加等待时间）
+            await asyncio.sleep(0.5)
+            await omni.kit.app.get_app().next_update_async()
+            await asyncio.sleep(1.0)  # 增加等待时间
+            await omni.kit.app.get_app().next_update_async()
+            await asyncio.sleep(0.5)
+            
+            # 多次尝试获取点云数据（解决同步问题）
+            pcd_data_check = None
+            for attempt in range(5):  # 增加重试次数
+                pcd_data_check = pcd_annotator.get_data()
+                if pcd_data_check is not None and 'data' in pcd_data_check:
+                    xyz_check = pcd_data_check['data']
+                    if xyz_check is not None and len(xyz_check) > 0:
+                        break  # 成功获取点云
+                if current_iter < 3 and attempt == 0:
+                    print(f"    [调试] 点云采集尝试 {attempt+1}: {type(pcd_data_check)}")
+                await asyncio.sleep(0.5)  # 增加等待时间
+            
+            pointcloud_valid = False
+            point_count = 0
+            
+            if enable_pointcloud_validation:
+                # 启用验证模式
+                if pcd_data_check is not None and 'data' in pcd_data_check:
+                    xyz_check = pcd_data_check['data']
+                    if xyz_check is not None and len(xyz_check) > 0:
+                        point_count = len(xyz_check)
+                        if point_count >= min_pointcloud_points:
+                            pointcloud_valid = True
+                            logger.log_pointcloud(True, point_count)
+                        else:
+                            logger.log_pointcloud(False, point_count, f"少于阈值 {min_pointcloud_points}")
+                    else:
+                        logger.log_pointcloud(False, 0, "数据为None或空")
+                else:
+                    logger.log_pointcloud(False, 0, "annotator返回None")
+                
+                # 如果点云无效，重新采样
+                if not pointcloud_valid:
+                    retry_count += 1
+                    continue
+            else:
+                # 禁用验证模式 - 直接采集，记录点云状态但不重试
+                if pcd_data_check is not None and 'data' in pcd_data_check:
+                    xyz_check = pcd_data_check['data']
+                    if xyz_check is not None and len(xyz_check) > 0:
+                        point_count = len(xyz_check)
+                        logger.log_pointcloud(True, point_count)
+                    else:
+                        logger.log_pointcloud(False, 0, "数据为None或空 (验证已禁用，继续采集)")
+                else:
+                    logger.log_pointcloud(False, 0, "annotator返回None (验证已禁用，继续采集)")
+                pointcloud_valid = True  # 强制通过
+            
+            # 点云有效（或验证被禁用），继续采集其他数据
+            frame_valid = True
+            
+        # 如果所有重试都失败，记录失败并跳过
+        if not frame_valid:
+            logger.log_frame_end(False)
+            current_iter += 1
+            continue
         
-        """4.2 采集RGB图像"""
+        """4.3 采集RGB图像"""
         rgb_image = camera.get_rgba()
-        if rgb_image is not None:
+        if rgb_image is not None and rgb_image.size > 0:
             bgr_image = cv2.cvtColor(rgb_image[..., :3], cv2.COLOR_RGB2BGR)
             rgb_path = f"{path_dir_rgb}/rgb_{current_iter:06d}.png"
             cv2.imwrite(rgb_path, bgr_image)
-            print(f"  ✓ RGB图像: {rgb_path}")
+            logger.log_rgb(True)
         else:
-            print(f"  ✗ RGB图像采集失败")
+            logger.log_rgb(False, "camera.get_rgba()返回None或空")
         
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.3)
         
-        """4.3 采集深度图"""
+        """4.4 采集深度图"""
         depth_data = depth_annotator.get_data()
-        if depth_data is not None:
+        if depth_data is not None and depth_data.size > 0:
+            # 记录深度图质量
+            logger.log_depth(True, depth_data)
+            
             # 保存原始深度数据（CSV）
             depth_csv_path = f"{path_dir_depth}/depth_{current_iter:06d}.csv"
             np.savetxt(depth_csv_path, depth_data, delimiter=' ', fmt='%.6f')
             
-            # 保存可视化深度图（PNG）
-            depth_norm = cv2.normalize(depth_data, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
-            depth_norm = 255 - depth_norm
-            depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_JET)
-            depth_png_path = f"{path_dir_depth}/depth_{current_iter:06d}.png"
-            cv2.imwrite(depth_png_path, depth_color)
-            print(f"  ✓ 深度图: {depth_csv_path}")
+            # 保存可视化深度图（PNG）- 改进可视化逻辑
+            depth_valid = depth_data[np.isfinite(depth_data) & (depth_data > 0)]
+            if len(depth_valid) > 0:
+                depth_min = np.min(depth_valid)
+                depth_max = np.max(depth_valid)
+                
+                # 归一化到0-255
+                depth_normalized = np.zeros_like(depth_data, dtype=np.uint8)
+                mask = np.isfinite(depth_data) & (depth_data > 0)
+                depth_normalized[mask] = ((depth_data[mask] - depth_min) / (depth_max - depth_min + 1e-6) * 255).astype(np.uint8)
+                
+                # 应用颜色映射
+                depth_color = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
+                depth_png_path = f"{path_dir_depth}/depth_{current_iter:06d}.png"
+                cv2.imwrite(depth_png_path, depth_color)
+            else:
+                # 全黑图
+                depth_color = np.zeros((img_height, img_width, 3), dtype=np.uint8)
+                depth_png_path = f"{path_dir_depth}/depth_{current_iter:06d}.png"
+                cv2.imwrite(depth_png_path, depth_color)
         else:
-            print(f"  ✗ 深度图采集失败")
+            logger.log_depth(False, reason="annotator返回None或空")
         
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.3)
         
-        """4.4 采集点云"""
+        """4.5 采集点云"""
         pcd_data = pcd_annotator.get_data()
         if pcd_data is not None and 'data' in pcd_data:
             # 检查点云数据是否有效
@@ -423,88 +1022,167 @@ async def generate_data():
             if xyz is not None and len(xyz) > 0:
                 pcd_path = f"{path_dir_pointcloud}/pointcloud_{current_iter:06d}.txt"
                 save_pointcloud_with_rgb(pcd_data, pcd_path)
-            else:
-                print(f"  ✗ 点云数据为空")
-        else:
-            print(f"  ✗ 点云采集失败")
+            # 点云已在前面验证过，这里只是保存
         
+        await asyncio.sleep(0.3)
+        
+        """4.6 采集物体信息（只识别视野内的物体）"""
+        # 策略：使用bbox_3d_annotator来判断哪些物体在视野内
+        # 然后根据路径名称匹配类别
+        
+        # 等待bbox_3d_annotator同步（类似点云）
+        await omni.kit.app.get_app().next_update_async()
         await asyncio.sleep(0.5)
         
-        """4.5 采集实例分割"""
-        instance_data = instance_annotator.get_data()
-        instance_mask = None
         object_list = []
+        bbox_data = bbox_3d_annotator.get_data()
         
-        if instance_data is not None:
-            id_to_semantics = instance_data['info']['idToSemantics']
-            id_to_labels = instance_data['info']['idToLabels']
+        # 调试：检查bbox_data（前5帧和点云为空的帧都输出）
+        should_debug = (current_iter < 5) or (pcd_data_check is None or 'data' not in pcd_data_check or len(pcd_data_check.get('data', [])) == 0)
+        
+        if should_debug:
+            if bbox_data is None:
+                print(f"  [调试] bbox_3d返回None")
+            elif 'info' not in bbox_data:
+                print(f"  [调试] bbox_3d没有'info'字段: {list(bbox_data.keys())}")
+            elif 'primPaths' not in bbox_data['info']:
+                print(f"  [调试] bbox_3d没有'primPaths'字段: {list(bbox_data['info'].keys())}")
+        
+        if bbox_data is not None and 'info' in bbox_data and 'primPaths' in bbox_data['info']:
+            visible_prim_paths = bbox_data['info']['primPaths']
             
-            # 创建实例掩码
-            instance_mask = np.zeros((img_height, img_width), dtype=np.int32)
-            instance_mask.fill(-1)
+            if should_debug:
+                print(f"  [调试] bbox_3d检测到 {len(visible_prim_paths)} 个可见物体")
+                if len(visible_prim_paths) > 0:
+                    print(f"  [调试] 前10个prim_path:")
+                    for i, path in enumerate(visible_prim_paths[:10]):
+                        print(f"    {i+1}. {path}")
             
+            # 只处理视野内的物体
             inst_idx = 0
-            for semantic_id, semantic_info in id_to_semantics.items():
-                class_name = semantic_info.get("class", "").lower()
+            for prim_path in visible_prim_paths:
+                prim_path_lower = prim_path.lower()
                 
-                # 检查是否在目标类别中
+                # 根据路径名称匹配类别
                 class_id = None
+                class_name = None
                 for key, val in construction_class.items():
-                    if key in class_name:
+                    if key in prim_path_lower:
                         class_id = val
+                        class_name = key
                         break
                 
+                # 如果匹配到类别，添加到列表
                 if class_id is not None:
-                    prim_path = id_to_labels.get(semantic_id, None)
-                    if prim_path:
-                        instance_mask[instance_data['data'] == semantic_id] = inst_idx
-                        object_list.append({
-                            "inst_idx": inst_idx,
-                            "class_id": class_id,
-                            "class_name": class_name,
-                            "prim_path": prim_path
-                        })
-                        inst_idx += 1
-            
-            print(f"  ✓ 实例分割: {len(object_list)} 个物体")
-        else:
-            print(f"  ✗ 实例分割采集失败")
+                    object_list.append({
+                        "inst_idx": inst_idx,
+                        "class_id": class_id,
+                        "class_name": class_name,
+                        "prim_path": prim_path
+                    })
+                    inst_idx += 1
+                    
+                    if should_debug:
+                        print(f"    ✓ 匹配: {class_name} <- {prim_path}")
+                elif should_debug:
+                    # 调试：显示未匹配的物体
+                    print(f"    ✗ 未匹配: {prim_path}")
         
-        """4.6 采集3D边界框位姿"""
-        bbox_data = bbox_3d_annotator.get_data()
+        if len(object_list) > 0:
+            print(f"  ✓ 标签: {len(object_list)} 个物体")
+        else:
+            print(f"  ⚠ 标签: 0 个物体（可能视野外或未匹配类别）")
+        
+        # 创建空的实例掩码（因为没有语义分割数据）
+        instance_mask = np.zeros((img_height, img_width), dtype=np.int32)
+        instance_mask.fill(-1)
+        
+        """4.7 采集3D边界框位姿"""
         pose_list = []
         
-        if bbox_data is not None and len(object_list) > 0:
+        # 尝试使用bbox_3d_annotator
+        bbox_data = bbox_3d_annotator.get_data()
+        use_annotator = False
+        
+        if bbox_data is not None and 'data' in bbox_data and len(bbox_data['data']) > 0:
+            use_annotator = True
             bbox_dict_list = bbox_data['data']
             bbox_prim_paths = bbox_data['info']['primPaths']
+        
+        for obj in object_list:
+            prim_path = obj['prim_path']
             
-            for obj in object_list:
-                prim_path = obj['prim_path']
+            # 方法1：尝试从bbox_3d_annotator获取
+            if use_annotator:
                 try:
                     bbox_index = bbox_prim_paths.index(prim_path)
                     bbox_dict = bbox_dict_list[bbox_index]
-                    
                     center, size, euler = bboxDict_to_transform(bbox_dict)
                     
                     pose_info = {
                         "inst_idx": obj['inst_idx'],
                         "class_id": obj['class_id'],
                         "class_name": obj['class_name'],
-                        "center": center,      # [x, y, z]
-                        "size": size,          # [width, height, depth]
-                        "rotation": euler,     # [roll, pitch, yaw] in degrees
+                        "center": center,
+                        "size": size,
+                        "rotation": euler,
                         "prim_path": prim_path
                     }
                     pose_list.append(pose_info)
-                except:
-                    print(f"    警告: 无法获取 {prim_path} 的边界框")
                     continue
+                except:
+                    pass  # 失败则尝试方法2
             
+            # 方法2：从USD prim直接获取位姿
+            try:
+                prim = stage.GetPrimAtPath(prim_path)
+                if prim:
+                    xform = UsdGeom.Xformable(prim)
+                    if xform:
+                        # 获取世界坐标变换
+                        world_matrix = xform.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+                        translation = world_matrix.ExtractTranslation()
+                        
+                        # 获取旋转
+                        rotation_matrix = world_matrix.ExtractRotationMatrix()
+                        rot_np = np.array(rotation_matrix.GetTranspose())
+                        r_obj = R.from_matrix(rot_np)
+                        euler = r_obj.as_euler('xyz', degrees=True)
+                        
+                        # 简单的尺寸估计（使用包围盒）
+                        try:
+                            bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ['default'])
+                            bbox = bbox_cache.ComputeWorldBound(prim)
+                            bbox_range = bbox.ComputeAlignedRange()
+                            size = [
+                                bbox_range.GetMax()[0] - bbox_range.GetMin()[0],
+                                bbox_range.GetMax()[1] - bbox_range.GetMin()[1],
+                                bbox_range.GetMax()[2] - bbox_range.GetMin()[2]
+                            ]
+                        except:
+                            size = [1.0, 1.0, 1.0]  # 默认尺寸
+                        
+                        pose_info = {
+                            "inst_idx": obj['inst_idx'],
+                            "class_id": obj['class_id'],
+                            "class_name": obj['class_name'],
+                            "center": [translation[0], translation[1], translation[2]],
+                            "size": size,
+                            "rotation": euler.tolist(),
+                            "prim_path": prim_path
+                        }
+                        pose_list.append(pose_info)
+            except Exception as e:
+                if current_iter < 3:
+                    print(f"    警告: 无法获取 {prim_path} 的位姿: {e}")
+                continue
+        
+        if len(pose_list) > 0:
             print(f"  ✓ 位姿估计: {len(pose_list)} 个物体")
         else:
-            print(f"  ✗ 3D边界框采集失败")
+            print(f"  ⚠ 位姿估计: 0 个物体")
         
-        """4.7 相机参数"""
+        """4.8 相机参数"""
         try:
             horizontal_aperture = camera.get_horizontal_aperture()
             focal_length = camera.get_focal_length()
@@ -525,7 +1203,7 @@ async def generate_data():
                 "height": img_height
             }
         
-        """4.8 保存标注文件"""
+        """4.9 保存标注文件"""
         label_data = {
             "frame_id": current_iter,
             "camera_pose": cam_pose,  # [x, y, z, qx, qy, qz, qw]
@@ -543,19 +1221,25 @@ async def generate_data():
         
         label_path = f"{path_dir_label}/label_{current_iter:06d}.json"
         save_label_json(label_data, label_path)
-        print(f"  ✓ 标注文件: {label_path}")
         
-        print(f">>> 帧 {current_iter} 完成 ✓\n")
+        # 记录标签状态
+        logger.log_labels(len(pose_list))
+        
+        # 记录帧完成
+        logger.log_frame_end(True)
         
         current_iter += 1
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.5)
     
-    """5. 清理"""
+    """5. 清理与报告"""
     print("\n" + "="*60)
     print("数据采集完成！")
-    print(f"总共生成: {current_iter} 帧")
     print(f"数据集路径: {path_dir_dataset}")
     print("="*60)
+    
+    # 保存日志汇总
+    report = logger.save_summary()
+    print("\n" + report)
     
     timeline.stop()
     await asyncio.sleep(1)

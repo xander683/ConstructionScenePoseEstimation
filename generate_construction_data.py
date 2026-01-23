@@ -61,22 +61,109 @@ max_retry_per_frame = 5       # 每帧最大重试次数（降低以加快生成
 enable_pointcloud_validation = False  # 禁用验证，先采集所有数据
 
 """数据集参数"""
-max_iterations = 20  # 生成的总帧数（快速测试）
+max_iterations = 30  # 生成的总帧数（快速测试）
 current_iter = 0
 
-"""物体类别定义（根据world2.usd场景中的物体调整）"""
-# 根据场景诊断结果更新：实际场景中有box(22个)和tree(109个)
+"""物体类别定义（根据world2.usd场景中的语义标签）"""
+# 语义标签名称 -> 类别ID（必须与add_semantic_labels.py中设置的名称匹配）
 construction_class = {
-    "box": 0,           # 场景中有22个box
-    "tree": 1,          # 场景中有109个tree
-    "cone": 2,          # 可能有锥形物体
-    "fence": 3,         # 可能有围栏（fencing）
-    "fencing": 3,       # 围栏的另一个名称
-    "construction": 4,  # 施工相关物体
-    "human": 5,         # 人物
-    "dhgen": 5,         # 人物模型（DHGen）
-    # 可根据实际场景添加更多类别
+    # 交通锥 (class_id = 0)
+    "trafficcone": 0,   # 语义标签: TrafficCone
+    "cone": 0,          # 路径匹配
+    
+    # 树木 (class_id = 1)
+    "tree": 1,          # 语义标签: Tree
+    
+    # 围栏 (class_id = 2)
+    "fence": 2,         # 语义标签: Fence
+    "fencing": 2,
+    "construction_site": 2,
+    
+    # 吊车/起重机 (class_id = 3)
+    "crane": 3,         # 语义标签: Crane
+    "pk7": 3,           # 路径匹配
+    
+    # 卡车/自卸车 (class_id = 4)
+    "dumper": 4,        # 语义标签: Dumper
+    "09684481": 4,      # 路径匹配
+    
+    # 人物 (class_id = 5)
+    "human": 5,         # 语义标签: Human
+    "dhgen": 5,         # 路径匹配
+    "skelroot": 5,
 }
+
+# 物体根路径模式（用于将Mesh组件聚合成完整物体）
+# 这些是场景中顶层物体的路径前缀
+OBJECT_ROOT_PATTERNS = [
+    # 围栏：/World/GroundPlane/Construction_Site_..._Fencing_height_XX
+    "/World/GroundPlane/Construction_Site_Construction_Zeppelin_Rental_GmbH_Metal_Construction_Site_Fencing_height_",
+    # 吊车：/World/GroundPlane/tn__Pk7501SLD_PNR3879_fPM
+    "/World/GroundPlane/tn__Pk7501SLD_PNR3879_fPM",
+    # 卡车：/World/GroundPlane/tn__09684481_
+    "/World/GroundPlane/tn__09684481_",
+    # 交通锥：/World/GroundPlane/Cone001_XX 或 /World/GroundPlane/Cone001
+    "/World/GroundPlane/Cone001",
+    # 人物：/World/GroundPlane/DHGen
+    "/World/GroundPlane/DHGen",
+    # 树木：/World/Tree/Tree_XX 或 /World/Tree/Tree
+    "/World/Tree/Tree",
+]
+
+
+def get_object_root(prim_path):
+    """
+    从Mesh路径获取物体根路径
+    例如: /World/GroundPlane/Cone001_01/Cone001 -> /World/GroundPlane/Cone001_01
+    
+    返回: (object_root_path, class_name, class_id) 或 (None, None, None)
+    """
+    prim_path_lower = prim_path.lower()
+    
+    # 特殊处理：围栏有编号后缀
+    if "fencing_height_" in prim_path_lower:
+        # 提取到 fencing_height_XX 为止
+        parts = prim_path.split("/")
+        for i, part in enumerate(parts):
+            if "Fencing_height_" in part:
+                root = "/".join(parts[:i+1])
+                return root, "fence", construction_class.get("fence", 2)
+    
+    # 特殊处理：树木
+    if "/world/tree/tree" in prim_path_lower:
+        parts = prim_path.split("/")
+        # /World/Tree/Tree_XX 或 /World/Tree/Tree
+        if len(parts) >= 4:
+            root = "/".join(parts[:4])  # /World/Tree/Tree 或 /World/Tree/Tree_01
+            return root, "tree", construction_class.get("tree", 1)
+    
+    # 特殊处理：交通锥
+    if "/cone001" in prim_path_lower:
+        parts = prim_path.split("/")
+        for i, part in enumerate(parts):
+            if part.lower().startswith("cone001"):
+                root = "/".join(parts[:i+1])
+                return root, "trafficcone", construction_class.get("trafficcone", 0)
+    
+    # 特殊处理：吊车
+    if "pk7501sld" in prim_path_lower or "pk7" in prim_path_lower:
+        return "/World/GroundPlane/tn__Pk7501SLD_PNR3879_fPM", "crane", construction_class.get("crane", 3)
+    
+    # 特殊处理：卡车
+    if "09684481" in prim_path_lower:
+        return "/World/GroundPlane/tn__09684481_", "dumper", construction_class.get("dumper", 4)
+    
+    # 特殊处理：人物
+    if "dhgen" in prim_path_lower:
+        return "/World/GroundPlane/DHGen", "human", construction_class.get("human", 5)
+    
+    # 默认：尝试根据类别关键词匹配
+    for key, class_id in construction_class.items():
+        if key in prim_path_lower:
+            # 返回原始路径作为根（可能不理想但至少能工作）
+            return prim_path, key, class_id
+    
+    return None, None, None
 
 """========== 日志记录类 =========="""
 
@@ -504,24 +591,31 @@ def depth_to_pointcloud_with_rgb(depth_data, rgb_image, camera_params, camera_po
             print(f"  ⚠ 无有效深度值用于生成点云")
             return None
         
-        # 计算相机坐标系下的3D坐标
-        z = depth_data[valid_mask]
-        x = (u[valid_mask] - cx) * z / fx
-        y = (v[valid_mask] - cy) * z / fy
+        # 计算相机坐标系下的3D坐标（标准pinhole模型）
+        # 在pinhole模型中：u = fx * X/Z + cx, v = fy * Y/Z + cy
+        # 所以：X = (u - cx) * Z / fx, Y = (v - cy) * Z / fy
+        z_camera = depth_data[valid_mask]  # 深度值（相机坐标系Z）
+        x_camera = (u[valid_mask] - cx) * z_camera / fx
+        y_camera = (v[valid_mask] - cy) * z_camera / fy
         
-        # 相机坐标系下的点云 (OpenGL坐标系: -Z forward, Y up)
-        # Isaac Sim使用右手坐标系，相机朝向-X，需要转换
-        points_camera = np.stack([x, y, z], axis=-1)
+        # 标准pinhole相机坐标系：X右，Y下，Z前（朝向+Z）
+        # Isaac Sim相机坐标系：相机朝向-X，up是+Z
+        # 需要从pinhole坐标系转换到Isaac Sim相机坐标系
+        # pinhole (X右, Y下, Z前) -> Isaac Sim (X前, Y右, Z上)
+        # 转换：Isaac_X = -pinhole_Z, Isaac_Y = -pinhole_X, Isaac_Z = pinhole_Y
+        # 但更简单的方法：直接使用pinhole坐标，然后通过旋转矩阵转换到世界坐标
+        points_camera_pinhole = np.stack([x_camera, y_camera, z_camera], axis=-1)
         
         # 转换到世界坐标系
         position = np.array(camera_pose[:3])
         quaternion = np.array(camera_pose[3:])  # [qx, qy, qz, qw]
         
-        # 四元数转旋转矩阵
-        rotation = R.from_quat(quaternion).as_matrix()
+        # 四元数转旋转矩阵（从相机坐标系到世界坐标系）
+        rotation_camera_to_world = R.from_quat(quaternion).as_matrix()
         
         # 应用变换：points_world = R @ points_camera.T + position
-        points_world = (rotation @ points_camera.T).T + position
+        # 注意：这里假设camera_pose的旋转矩阵已经是从相机到世界的变换
+        points_world = (rotation_camera_to_world @ points_camera_pinhole.T).T + position
         
         # 获取对应的RGB值
         if rgb_image is not None and rgb_image.size > 0:
@@ -619,62 +713,102 @@ def get_systematic_camera_positions(num_frames=20):
     网格化采样策略：在场景内均匀分布相机
     
     策略：
-    1. 将场景划分为网格
-    2. 在每个网格位置放置相机
-    3. 相机朝不同方向拍摄（水平转动）
-    4. 确保覆盖整个场景
+    1. 首先使用预定义的关键位置
+    2. 如果需要更多帧，使用环形采样生成额外位置
+    3. 确保覆盖整个场景
     
     返回：[(cam_pos, target_pos), ...]
     """
     positions = []
+    heights = [1.6, 1.7, 1.8, 2.0, 2.5, 3.0]  # 扩展高度范围
     
-    # 根据分析：物体主要集中在场景左侧和中心区域
-    # 调整采样范围到物体密集区
-    
-    heights = [1.6, 1.7, 1.8]
-    frame_count = 0
-    
-    # 策略1: 在物体密集区（左侧和中心）采样
-    # 根据分析，最佳位置在 x=[-10, 0], y=[-8, 8]
-    dense_positions = [
+    # 预定义的关键位置（覆盖场景的重要视角）
+    key_positions = [
         # 中心区域（物体最密集）
-        ([-3, -3], [0, 0]),    # 中心偏左下
-        ([-3, 3], [0, 0]),     # 中心偏左上
-        ([0, 0], [5, 0]),      # 正中心看右
-        ([0, 0], [-5, 0]),     # 正中心看左
+        ([-3, -3], [0, 0]),
+        ([-3, 3], [0, 0]),
+        ([0, 0], [5, 0]),
+        ([0, 0], [-5, 0]),
         
         # 左侧区域
-        ([-8, -3], [0, 0]),    # 左侧看中心
-        ([-8, 3], [0, 0]),     # 左侧看中心
-        ([-5, -8], [0, 0]),    # 左下角看中心
-        ([-5, 8], [0, 0]),     # 左上角看中心
+        ([-8, -3], [0, 0]),
+        ([-8, 3], [0, 0]),
+        ([-5, -8], [0, 0]),
+        ([-5, 8], [0, 0]),
         
         # 环绕中心
-        ([6, 0], [0, 0]),      # 右侧看中心
-        ([0, 6], [0, 0]),      # 上方看中心
-        ([0, -6], [0, 0]),     # 下方看中心
-        ([-6, 0], [0, 0]),     # 左侧看中心
+        ([6, 0], [0, 0]),
+        ([0, 6], [0, 0]),
+        ([0, -6], [0, 0]),
+        ([-6, 0], [0, 0]),
         
         # 对角线
-        ([5, 5], [0, 0]),      # 右上看中心
-        ([5, -5], [0, 0]),     # 右下看中心
-        ([-5, 5], [0, 0]),     # 左上看中心
-        ([-5, -5], [0, 0]),    # 左下看中心
+        ([5, 5], [0, 0]),
+        ([5, -5], [0, 0]),
+        ([-5, 5], [0, 0]),
+        ([-5, -5], [0, 0]),
         
-        # 更近距离
-        ([3, 0], [0, 0]),      # 近距离右侧
-        ([-3, 0], [0, 0]),     # 近距离左侧
-        ([0, 3], [0, 0]),      # 近距离上方
-        ([0, -3], [0, 0]),     # 近距离下方
+        # 近距离
+        ([3, 0], [0, 0]),
+        ([-3, 0], [0, 0]),
+        ([0, 3], [0, 0]),
+        ([0, -3], [0, 0]),
     ]
     
-    for i, (cam_xy, target_xy) in enumerate(dense_positions):
+    frame_count = 0
+    
+    # 首先添加预定义位置
+    for cam_xy, target_xy in key_positions:
         if frame_count >= num_frames:
             break
         
         cam_z = heights[frame_count % len(heights)]
         cam_position = np.array([cam_xy[0], cam_xy[1], cam_z])
         target_point = np.array([target_xy[0], target_xy[1], cam_z])
+        
+        positions.append((cam_position, target_point))
+        frame_count += 1
+    
+    # 如果需要更多位置，使用环形采样生成
+    if frame_count < num_frames:
+        # 不同半径的环
+        radii = [4, 6, 8, 10, 12]
+        # 每个环上的采样点数
+        points_per_ring = 8
+        
+        for radius in radii:
+            for i in range(points_per_ring):
+                if frame_count >= num_frames:
+                    break
+                
+                # 计算环上的位置
+                angle = 2 * np.pi * i / points_per_ring
+                cam_x = radius * np.cos(angle)
+                cam_y = radius * np.sin(angle)
+                cam_z = heights[frame_count % len(heights)]
+                
+                cam_position = np.array([cam_x, cam_y, cam_z])
+                target_point = np.array([0, 0, cam_z])  # 看向中心
+                
+                positions.append((cam_position, target_point))
+                frame_count += 1
+            
+            if frame_count >= num_frames:
+                break
+    
+    # 如果还需要更多，添加随机扰动的位置
+    while frame_count < num_frames:
+        # 在场景范围内随机采样
+        cam_x = np.random.uniform(-10, 8)
+        cam_y = np.random.uniform(-10, 10)
+        cam_z = heights[frame_count % len(heights)]
+        
+        # 随机目标点（在中心区域附近）
+        target_x = np.random.uniform(-2, 2)
+        target_y = np.random.uniform(-2, 2)
+        
+        cam_position = np.array([cam_x, cam_y, cam_z])
+        target_point = np.array([target_x, target_y, cam_z])
         
         positions.append((cam_position, target_point))
         frame_count += 1
@@ -1014,21 +1148,65 @@ async def generate_data():
         
         await asyncio.sleep(0.3)
         
-        """4.5 采集点云"""
+        """4.5 采集点云（带后备方案）"""
+        pcd_path = f"{path_dir_pointcloud}/pointcloud_{current_iter:06d}.txt"
+        pcd_saved = False
+        
+        # 方法1: 尝试使用pointcloud annotator
         pcd_data = pcd_annotator.get_data()
         if pcd_data is not None and 'data' in pcd_data:
-            # 检查点云数据是否有效
             xyz = pcd_data['data']
             if xyz is not None and len(xyz) > 0:
-                pcd_path = f"{path_dir_pointcloud}/pointcloud_{current_iter:06d}.txt"
                 save_pointcloud_with_rgb(pcd_data, pcd_path)
-            # 点云已在前面验证过，这里只是保存
+                pcd_saved = True
+                if current_iter < 3:
+                    print(f"  [点云] 使用annotator: {len(xyz)} 个点")
+        
+        # 方法2: 如果annotator失败，从深度图生成点云
+        if not pcd_saved and depth_data is not None and rgb_image is not None:
+            try:
+                # 获取相机参数
+                try:
+                    horizontal_aperture = camera.get_horizontal_aperture()
+                    focal_length = camera.get_focal_length()
+                    vertical_aperture = horizontal_aperture * (img_height / img_width)
+                    cam_params = {
+                        "horizontal_aperture": horizontal_aperture,
+                        "vertical_aperture": vertical_aperture,
+                        "focal_length": focal_length,
+                        "width": img_width,
+                        "height": img_height
+                    }
+                except:
+                    cam_params = {
+                        "horizontal_aperture": 20.955,
+                        "vertical_aperture": 15.2908,
+                        "focal_length": 18.14,
+                        "width": img_width,
+                        "height": img_height
+                    }
+                
+                # 从深度图生成点云
+                xyzrgb = depth_to_pointcloud_with_rgb(depth_data, rgb_image, cam_params, cam_pose)
+                if xyzrgb is not None and len(xyzrgb) > 0:
+                    np.savetxt(pcd_path, xyzrgb, fmt='%.6f', delimiter=' ', 
+                              header='x y z r g b', comments='')
+                    pcd_saved = True
+                    logger.log_pointcloud(True, len(xyzrgb))
+                    if current_iter < 3:
+                        print(f"  [点云] 使用深度图后备方案: {len(xyzrgb)} 个点")
+            except Exception as e:
+                if current_iter < 3:
+                    print(f"  [点云] 深度图后备方案失败: {e}")
+        
+        if not pcd_saved:
+            if current_iter < 3:
+                print(f"  [点云] 所有方法都失败，未保存点云")
         
         await asyncio.sleep(0.3)
         
         """4.6 采集物体信息（只识别视野内的物体）"""
-        # 策略：使用bbox_3d_annotator来判断哪些物体在视野内
-        # 然后根据路径名称匹配类别
+        # 策略：优先使用bbox_3d_annotator，失败时遍历场景
         
         # 等待bbox_3d_annotator同步（类似点云）
         await omni.kit.app.get_app().next_update_async()
@@ -1037,61 +1215,130 @@ async def generate_data():
         object_list = []
         bbox_data = bbox_3d_annotator.get_data()
         
-        # 调试：检查bbox_data（前5帧和点云为空的帧都输出）
-        should_debug = (current_iter < 5) or (pcd_data_check is None or 'data' not in pcd_data_check or len(pcd_data_check.get('data', [])) == 0)
+        # 调试：前3帧总是输出，后续帧如果没有检测到物体也输出
+        should_debug = (current_iter < 3)
         
+        visible_prim_paths = []
+        
+        # 方法1: 尝试从bbox_3d_annotator获取可见物体
+        if bbox_data is not None and 'info' in bbox_data:
+            if 'primPaths' in bbox_data['info']:
+                visible_prim_paths = bbox_data['info']['primPaths']
+                if should_debug or len(visible_prim_paths) == 0:
+                    print(f"  [物体检测] bbox_3d检测到 {len(visible_prim_paths)} 个可见物体")
+                    if len(visible_prim_paths) > 0:
+                        print(f"  [物体检测] 所有prim路径 (前10个):")
+                        for i, path in enumerate(visible_prim_paths[:10]):
+                            path_lower = path.lower()
+                            matched = "未匹配"
+                            for key in construction_class.keys():
+                                if key in path_lower:
+                                    matched = f"✓ {key}"
+                                    break
+                            print(f"    {i+1}. {path} [{matched}]")
+                        if len(visible_prim_paths) > 10:
+                            print(f"    ... 还有 {len(visible_prim_paths)-10} 个")
+            else:
+                if should_debug:
+                    print(f"  [物体检测] bbox_3d没有'primPaths'字段: {list(bbox_data['info'].keys())}")
+        else:
+            if should_debug:
+                if bbox_data is None:
+                    print(f"  [物体检测] bbox_3d返回None")
+                elif 'info' not in bbox_data:
+                    print(f"  [物体检测] bbox_3d没有'info'字段: {list(bbox_data.keys())}")
+        
+        # 方法2: 使用instance_segmentation查看实际可见的物体（用于调试）
         if should_debug:
-            if bbox_data is None:
-                print(f"  [调试] bbox_3d返回None")
-            elif 'info' not in bbox_data:
-                print(f"  [调试] bbox_3d没有'info'字段: {list(bbox_data.keys())}")
-            elif 'primPaths' not in bbox_data['info']:
-                print(f"  [调试] bbox_3d没有'primPaths'字段: {list(bbox_data['info'].keys())}")
+            try:
+                instance_data = instance_annotator.get_data()
+                if instance_data is not None and 'info' in instance_data:
+                    print(f"  [实例分割] info字段: {list(instance_data['info'].keys())}")
+                    
+                    # 检查idToLabels
+                    if 'idToLabels' in instance_data['info']:
+                        id_to_labels = instance_data['info']['idToLabels']
+                        print(f"  [实例分割] idToLabels检测到 {len(id_to_labels)} 个实例:")
+                        for instance_id, label_info in list(id_to_labels.items())[:10]:
+                            # label_info可能是字符串或字典
+                            if isinstance(label_info, dict):
+                                class_name = label_info.get('class', 'unknown')
+                                print(f"    ID {instance_id}: {class_name} | {label_info}")
+                            else:
+                                print(f"    ID {instance_id}: {label_info}")
+                    
+                    # 检查idToSemantics（更详细的语义信息）
+                    if 'idToSemantics' in instance_data['info']:
+                        id_to_semantics = instance_data['info']['idToSemantics']
+                        print(f"  [实例分割] idToSemantics检测到 {len(id_to_semantics)} 个语义:")
+                        for sem_id, sem_info in list(id_to_semantics.items())[:10]:
+                            if isinstance(sem_info, dict):
+                                print(f"    语义ID {sem_id}: {sem_info}")
+                            else:
+                                print(f"    语义ID {sem_id}: {sem_info}")
+                            
+            except Exception as e:
+                print(f"  [实例分割] 检查失败: {e}")
+                import traceback
+                traceback.print_exc()
         
-        if bbox_data is not None and 'info' in bbox_data and 'primPaths' in bbox_data['info']:
-            visible_prim_paths = bbox_data['info']['primPaths']
+        # 如果bbox_3d未返回物体，输出可能原因
+        if len(visible_prim_paths) == 0 and should_debug:
+            print(f"  [物体检测] ⚠ bbox_3d未返回任何物体")
+            print(f"  [物体检测] 可能原因：")
+            print(f"    1. 物体没有设置Semantic Label")
+            print(f"    2. 物体的Mesh没有启用包围盒计算")
+            print(f"    3. 物体被标记为不可见或禁用")
+        
+        # 处理找到的prim路径 - 聚合Mesh组件为完整物体
+        if len(visible_prim_paths) > 0:
+            # 使用字典聚合：object_root -> {class_id, class_name, mesh_paths}
+            object_roots = {}
+            unmatched_count = 0
+            
+            for prim_path in visible_prim_paths:
+                # 获取物体根路径和类别
+                object_root, class_name, class_id = get_object_root(prim_path)
+                
+                if object_root is not None:
+                    if object_root not in object_roots:
+                        object_roots[object_root] = {
+                            "class_id": class_id,
+                            "class_name": class_name,
+                            "mesh_paths": []
+                        }
+                    object_roots[object_root]["mesh_paths"].append(prim_path)
+                else:
+                    unmatched_count += 1
+                    if should_debug and unmatched_count <= 3:
+                        print(f"    ✗ 未匹配: {prim_path}")
+            
+            # 将聚合后的物体添加到列表
+            inst_idx = 0
+            for object_root, obj_info in object_roots.items():
+                object_list.append({
+                    "inst_idx": inst_idx,
+                    "class_id": obj_info["class_id"],
+                    "class_name": obj_info["class_name"],
+                    "prim_path": object_root,  # 使用物体根路径
+                    "mesh_count": len(obj_info["mesh_paths"])  # 记录包含的Mesh数量
+                })
+                inst_idx += 1
             
             if should_debug:
-                print(f"  [调试] bbox_3d检测到 {len(visible_prim_paths)} 个可见物体")
-                if len(visible_prim_paths) > 0:
-                    print(f"  [调试] 前10个prim_path:")
-                    for i, path in enumerate(visible_prim_paths[:10]):
-                        print(f"    {i+1}. {path}")
-            
-            # 只处理视野内的物体
-            inst_idx = 0
-            for prim_path in visible_prim_paths:
-                prim_path_lower = prim_path.lower()
-                
-                # 根据路径名称匹配类别
-                class_id = None
-                class_name = None
-                for key, val in construction_class.items():
-                    if key in prim_path_lower:
-                        class_id = val
-                        class_name = key
-                        break
-                
-                # 如果匹配到类别，添加到列表
-                if class_id is not None:
-                    object_list.append({
-                        "inst_idx": inst_idx,
-                        "class_id": class_id,
-                        "class_name": class_name,
-                        "prim_path": prim_path
-                    })
-                    inst_idx += 1
-                    
-                    if should_debug:
-                        print(f"    ✓ 匹配: {class_name} <- {prim_path}")
-                elif should_debug:
-                    # 调试：显示未匹配的物体
-                    print(f"    ✗ 未匹配: {prim_path}")
+                print(f"  [物体检测] 聚合统计: {len(visible_prim_paths)} 个Mesh -> {len(object_roots)} 个物体")
+                print(f"  [物体检测] 物体列表:")
+                for obj in object_list[:10]:
+                    print(f"    - {obj['class_name']}: {obj['prim_path']} ({obj.get('mesh_count', 1)} meshes)")
+                if len(object_list) > 10:
+                    print(f"    ... 还有 {len(object_list)-10} 个")
+                if unmatched_count > 0:
+                    print(f"  [物体检测] 未匹配: {unmatched_count} 个Mesh")
         
         if len(object_list) > 0:
             print(f"  ✓ 标签: {len(object_list)} 个物体")
         else:
-            print(f"  ⚠ 标签: 0 个物体（可能视野外或未匹配类别）")
+            print(f"  ⚠ 标签: 0 个物体（视野外或未匹配类别）")
         
         # 创建空的实例掩码（因为没有语义分割数据）
         instance_mask = np.zeros((img_height, img_width), dtype=np.int32)

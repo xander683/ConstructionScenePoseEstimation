@@ -61,7 +61,7 @@ max_retry_per_frame = 5       # 每帧最大重试次数（降低以加快生成
 enable_pointcloud_validation = False  # 禁用验证，先采集所有数据
 
 """数据集参数"""
-max_iterations = 30  # 生成的总帧数（快速测试）
+max_iterations = 41  # 生成的总帧数（快速测试）
 current_iter = 0
 
 """物体类别定义（根据world2.usd场景中的语义标签）"""
@@ -79,9 +79,21 @@ construction_class = {
     "fencing": 2,
     "construction_site": 2,
     
-    # 吊车/起重机 (class_id = 3)
+    # 吊车/起重机 - 整体 (class_id = 3)
     "crane": 3,         # 语义标签: Crane
     "pk7": 3,           # 路径匹配
+    
+    # 吊车部件 - 底座 (class_id = 6)
+    "cranebase": 6,     # 语义标签: CraneBase
+    
+    # 吊车部件 - 立柱/转台 (class_id = 7)
+    "cranecolumn": 7,   # 语义标签: CraneColumn
+    
+    # 吊车部件 - 主臂 (class_id = 8)
+    "craneboom": 8,     # 语义标签: CraneBoom
+    
+    # 吊车部件 - 伸缩臂 (class_id = 9)
+    "cranetelescopic": 9,  # 语义标签: CraneTelescopic
     
     # 卡车/自卸车 (class_id = 4)
     "dumper": 4,        # 语义标签: Dumper
@@ -817,6 +829,112 @@ def get_systematic_camera_positions(num_frames=20):
     return positions
 
 
+def randomize_object_positions(stage):
+    """
+    随机改变场景中可移动物体的位置和姿态
+    
+    参数:
+        stage: USD Stage对象
+    
+    功能:
+        - 吊车：只改变位置（±3米），不旋转
+        - 铲车、人物、交通锥：改变位置+姿态（绕Z轴旋转）
+        高度保持不变
+    """
+    from pxr import UsdGeom, Gf
+    
+    # 定义需要随机移动的物体及其移动范围
+    objects_to_randomize = {
+        # 路径: (x_range, y_range, z_offset_range, rotation_range_deg, rotate_enabled) 
+        "/World/GroundPlane/tn__Pk7501SLD_PNR3879_fPM": (3.0, 3.0, 0.0, 0, False),  # 吊车：只移动位置
+        "/World/GroundPlane/tn__09684481_": (3.0, 3.0, 0.0, 180.0, True),  # 铲车：位置+姿态
+        "/World/GroundPlane/DHGen": (2.0, 2.0, 0.0, 180.0, True),  # 人物：位置+姿态
+        "/World/GroundPlane/Cone001": (1.5, 1.5, 0.0, 180.0, True),  # 交通锥：位置+姿态
+    }
+    
+    randomized_objects = []
+    
+    for prim_path, (x_range, y_range, z_range, rot_range, rotate_enabled) in objects_to_randomize.items():
+        prim = stage.GetPrimAtPath(prim_path)
+        
+        if not prim.IsValid():
+            # 尝试查找类似路径（可能有后缀）
+            parent_path = "/".join(prim_path.split("/")[:-1])
+            obj_name = prim_path.split("/")[-1]
+            parent_prim = stage.GetPrimAtPath(parent_path)
+            
+            if parent_prim.IsValid():
+                # 查找所有子对象，找到名称匹配的
+                for child in parent_prim.GetChildren():
+                    if child.GetName().startswith(obj_name):
+                        prim = child
+                        prim_path = str(child.GetPath())
+                        break
+        
+        if prim.IsValid():
+            xformable = UsdGeom.Xformable(prim)
+            
+            if xformable:
+                # 获取当前变换
+                try:
+                    current_transform = xformable.GetLocalTransformation()
+                    current_position = current_transform.ExtractTranslation()
+                    
+                    # 生成随机位置偏移
+                    x_offset = np.random.uniform(-x_range, x_range)
+                    y_offset = np.random.uniform(-y_range, y_range)
+                    z_offset = np.random.uniform(-z_range, z_range) if z_range > 0 else 0
+                    
+                    # 计算新位置
+                    new_x = current_position[0] + x_offset
+                    new_y = current_position[1] + y_offset
+                    new_z = current_position[2] + z_offset
+                    
+                    # 查找或创建translate操作
+                    translate_op = None
+                    rotate_op = None
+                    
+                    for op in xformable.GetOrderedXformOps():
+                        if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                            translate_op = op
+                        elif op.GetOpType() == UsdGeom.XformOp.TypeRotateZ:
+                            rotate_op = op
+                    
+                    # 如果没有translate操作，添加一个
+                    if translate_op is None:
+                        translate_op = xformable.AddTranslateOp()
+                    
+                    # 设置新的位置
+                    translate_op.Set(Gf.Vec3d(new_x, new_y, new_z))
+                    
+                    # 如果允许旋转，则修改旋转
+                    rotation_deg = 0
+                    if rotate_enabled and rot_range > 0:
+                        rotation_deg = np.random.uniform(-rot_range, rot_range)
+                        
+                        # 如果没有rotateZ操作，添加一个
+                        if rotate_op is None:
+                            rotate_op = xformable.AddRotateZOp()
+                        
+                        # 设置新的旋转（单位：度）
+                        rotate_op.Set(rotation_deg)
+                    
+                    randomized_objects.append({
+                        'path': prim_path,
+                        'old_pos': [current_position[0], current_position[1], current_position[2]],
+                        'new_pos': [new_x, new_y, new_z],
+                        'offset': [x_offset, y_offset, z_offset],
+                        'rotation': rotation_deg if rotate_enabled else None
+                    })
+                    
+                except Exception as e:
+                    print(f"  ⚠ 无法移动物体 {prim_path}: {str(e)}")
+        else:
+            print(f"  ⚠ 物体不存在: {prim_path}")
+    
+    return randomized_objects
+
+
 """========== 准备工作 =========="""
 
 # 创建输出目录
@@ -998,6 +1116,27 @@ async def generate_data():
     current_iter = 0
     
     while current_iter < actual_frames:
+        # 每20帧随机改变物体位置
+        if current_iter > 0 and current_iter % 20 == 0:
+            print(f"\n[物体位置随机化] 帧 {current_iter} - 重新随机物体位置...")
+            randomized = randomize_object_positions(stage)
+            if randomized:
+                print(f"  ✓ 已随机移动 {len(randomized)} 个物体:")
+                for obj_info in randomized:
+                    offset = obj_info['offset']
+                    rotation = obj_info.get('rotation')
+                    obj_name = obj_info['path'].split('/')[-1]
+                    if rotation is not None:
+                        print(f"    - {obj_name}: 位置偏移 ({offset[0]:.2f}, {offset[1]:.2f})m, 旋转 {rotation:.1f}°")
+                    else:
+                        print(f"    - {obj_name}: 位置偏移 ({offset[0]:.2f}, {offset[1]:.2f})m")
+            else:
+                print(f"  ⚠ 未能随机移动任何物体")
+            
+            # 等待场景更新
+            await omni.kit.app.get_app().next_update_async()
+            await asyncio.sleep(0.5)
+        
         # 使用预定义的相机位置
         cam_position, aimed_point = all_camera_positions[current_iter]
         logger.log_frame_start(current_iter, cam_position)

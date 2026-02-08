@@ -105,6 +105,24 @@ construction_class = {
     "skelroot": 5,
 }
 
+# 吊车部件路径映射（来自add_crane_part_labels.py的精确路径）
+# 键: 吊车根下的一级子节点名(小写) -> (部件类名, 类别ID)
+CRANE_PART_CHILD_MAP = {
+    "s104gg03a_sw":           ("cranebase", 6),
+    "s104s01kb_sw":           ("cranebase", 6),
+    "s104hz01ka_sw":          ("cranecolumn", 7),
+    "s104h01kb_sw":           ("cranecolumn", 7),
+    "s104hz02ka_sw":          ("cranecolumn", 7),
+    "s104kz01ka_sw":          ("cranecolumn", 7),
+    "tn__s104ekb_as_sw_jj7":  ("craneboom", 8),
+    "s104kz02ka_sw":          ("cranetelescopic", 9),
+    "tn__hhk320ka_sw_lg":     ("cranetelescopic", 9),
+    "tn__hhk319_sw_od":       ("cranetelescopic", 9),
+}
+
+# 运行时构建的完整吊车路径映射（由build_crane_part_map填充）
+_crane_part_map = {}
+
 # 物体根路径模式（用于将Mesh组件聚合成完整物体）
 # 这些是场景中顶层物体的路径前缀
 OBJECT_ROOT_PATTERNS = [
@@ -157,9 +175,46 @@ def get_object_root(prim_path):
                 root = "/".join(parts[:i+1])
                 return root, "trafficcone", construction_class.get("trafficcone", 0)
     
-    # 特殊处理：吊车
+    # 特殊处理：吊车及其部件
     if "pk7501sld" in prim_path_lower or "pk7" in prim_path_lower:
-        return "/World/GroundPlane/tn__Pk7501SLD_PNR3879_fPM", "crane", construction_class.get("crane", 3)
+        crane_root = "/World/GroundPlane/tn__Pk7501SLD_PNR3879_fPM"
+        
+        # 方法1: 使用运行时构建的完整映射表（最准确）
+        if _crane_part_map and prim_path in _crane_part_map:
+            part_name, class_id = _crane_part_map[prim_path]
+            # 部件的聚合根路径 = crane_root + 部件类名
+            part_root = crane_root + "#" + part_name
+            return part_root, part_name, class_id
+        
+        # 方法2: 通过已知的一级子节点名精确匹配
+        if prim_path.startswith(crane_root + "/") or prim_path_lower.startswith(crane_root.lower() + "/"):
+            remaining = prim_path[len(crane_root) + 1:]
+            first_segment = remaining.split("/")[0]
+            first_segment_lower = first_segment.lower()
+            
+            if first_segment_lower in CRANE_PART_CHILD_MAP:
+                part_name, class_id = CRANE_PART_CHILD_MAP[first_segment_lower]
+                part_root = crane_root + "#" + part_name
+                return part_root, part_name, class_id
+        
+        # 方法3: 关键词匹配（兜底）
+        sub_path = prim_path_lower[prim_path_lower.find("pk7"):]
+        base_kw = ["base", "chassis", "footer", "support", "grund", "fahrwerk"]
+        column_kw = ["column", "turret", "mast", "tower", "saeule", "drehwerk", "oberwagen"]
+        boom_kw = ["boom", "arm", "jib", "ausleger"]
+        telescopic_kw = ["telescop", "extension", "teleskop", "auszug"]
+        
+        if any(kw in sub_path for kw in base_kw):
+            return crane_root + "#cranebase", "cranebase", construction_class.get("cranebase", 6)
+        elif any(kw in sub_path for kw in column_kw):
+            return crane_root + "#cranecolumn", "cranecolumn", construction_class.get("cranecolumn", 7)
+        elif any(kw in sub_path for kw in boom_kw):
+            return crane_root + "#craneboom", "craneboom", construction_class.get("craneboom", 8)
+        elif any(kw in sub_path for kw in telescopic_kw):
+            return crane_root + "#cranetelescopic", "cranetelescopic", construction_class.get("cranetelescopic", 9)
+        
+        # 默认返回整体吊车
+        return crane_root, "crane", construction_class.get("crane", 3)
     
     # 特殊处理：卡车
     if "09684481" in prim_path_lower:
@@ -739,41 +794,47 @@ def get_systematic_camera_positions(num_frames=20):
     dumper_center = [-7.37, -0.59]
     
     key_positions = [
-        # 中心区域（物体最密集）
+        # ===== 拖车/铲车 专用视角 (40%占比，提升出现频率) =====
+        ([-15, -0.6], dumper_center),    # 拖车左侧远距
+        ([-2, -0.6], dumper_center),     # 拖车右侧近距
+        ([-7.4, 6], dumper_center),      # 拖车前方
+        ([-7.4, -7], dumper_center),     # 拖车后方
+        ([-12, 4], dumper_center),       # 拖车左前远距
+        ([-12, -5], dumper_center),      # 拖车左后远距
+        ([-4, 4], dumper_center),        # 拖车右前近距
+        ([-4, -4], dumper_center),       # 拖车右后近距
+        ([-10, 0], dumper_center),       # 拖车正左侧
+        ([-5, 2], dumper_center),        # 拖车右前45°
+        ([-5, -3], dumper_center),       # 拖车右后45°
+        ([-9, -4], dumper_center),       # 拖车左后45°
+        
+        # ===== 中心区域（物体最密集）=====
         ([-3, -3], [0, 0]),
         ([-3, 3], [0, 0]),
         ([0, 0], [5, 0]),
         ([0, 0], [-5, 0]),
         
-        # 铲车专用视角（增加4个位置，提高铲车出现概率）
-        ([-15, -0.6], dumper_center),   # 铲车左侧
-        ([-2, -0.6], dumper_center),    # 铲车右侧
-        ([-7.4, 6], dumper_center),     # 铲车前方
-        ([-7.4, -7], dumper_center),    # 铲车后方
-        
-        # 左侧区域
-        ([-8, -3], [0, 0]),
-        ([-8, 3], [0, 0]),
-        ([-5, -8], [0, 0]),
-        ([-5, 8], [0, 0]),
-        
-        # 环绕中心
+        # ===== 环绕中心 =====
         ([6, 0], [0, 0]),
         ([0, 6], [0, 0]),
         ([0, -6], [0, 0]),
         ([-6, 0], [0, 0]),
         
-        # 对角线
+        # ===== 对角线 =====
         ([5, 5], [0, 0]),
         ([5, -5], [0, 0]),
         ([-5, 5], [0, 0]),
         ([-5, -5], [0, 0]),
         
-        # 近距离
+        # ===== 近距离 =====
         ([3, 0], [0, 0]),
         ([-3, 0], [0, 0]),
         ([0, 3], [0, 0]),
         ([0, -3], [0, 0]),
+        
+        # ===== 左侧区域 =====
+        ([-8, -3], [0, 0]),
+        ([-8, 3], [0, 0]),
     ]
     
     frame_count = 0
@@ -790,11 +851,10 @@ def get_systematic_camera_positions(num_frames=20):
         positions.append((cam_position, target_point))
         frame_count += 1
     
-    # 如果需要更多位置，使用环形采样生成
+    # 如果需要更多位置，使用混合采样策略
     if frame_count < num_frames:
         # 不同半径的环
         radii = [4, 6, 8, 10, 12]
-        # 每个环上的采样点数
         points_per_ring = 8
         
         for radius in radii:
@@ -802,14 +862,20 @@ def get_systematic_camera_positions(num_frames=20):
                 if frame_count >= num_frames:
                     break
                 
-                # 计算环上的位置
                 angle = 2 * np.pi * i / points_per_ring
                 cam_x = radius * np.cos(angle)
                 cam_y = radius * np.sin(angle)
                 cam_z = heights[frame_count % len(heights)]
                 
                 cam_position = np.array([cam_x, cam_y, cam_z])
-                target_point = np.array([0, 0, cam_z])  # 看向中心
+                
+                # 40% 概率看向拖车区域，60% 看向中心
+                if np.random.random() < 0.4:
+                    target_x = dumper_center[0] + np.random.uniform(-2, 2)
+                    target_y = dumper_center[1] + np.random.uniform(-2, 2)
+                    target_point = np.array([target_x, target_y, cam_z])
+                else:
+                    target_point = np.array([0, 0, cam_z])
                 
                 positions.append((cam_position, target_point))
                 frame_count += 1
@@ -817,16 +883,23 @@ def get_systematic_camera_positions(num_frames=20):
             if frame_count >= num_frames:
                 break
     
-    # 如果还需要更多，添加随机扰动的位置
+    # 如果还需要更多，添加随机采样（偏向拖车区域）
     while frame_count < num_frames:
-        # 在场景范围内随机采样
-        cam_x = np.random.uniform(-10, 8)
-        cam_y = np.random.uniform(-10, 10)
         cam_z = heights[frame_count % len(heights)]
         
-        # 随机目标点（在中心区域附近）
-        target_x = np.random.uniform(-2, 2)
-        target_y = np.random.uniform(-2, 2)
+        # 50% 概率生成拖车附近的相机位置
+        if np.random.random() < 0.5:
+            angle = np.random.uniform(0, 2 * np.pi)
+            dist = np.random.uniform(5, 12)
+            cam_x = dumper_center[0] + dist * np.cos(angle)
+            cam_y = dumper_center[1] + dist * np.sin(angle)
+            target_x = dumper_center[0] + np.random.uniform(-1, 1)
+            target_y = dumper_center[1] + np.random.uniform(-1, 1)
+        else:
+            cam_x = np.random.uniform(-10, 8)
+            cam_y = np.random.uniform(-10, 10)
+            target_x = np.random.uniform(-3, 3)
+            target_y = np.random.uniform(-3, 3)
         
         cam_position = np.array([cam_x, cam_y, cam_z])
         target_point = np.array([target_x, target_y, cam_z])
@@ -840,108 +913,486 @@ def get_systematic_camera_positions(num_frames=20):
 
 def randomize_object_positions(stage):
     """
-    随机改变场景中可移动物体的位置和姿态
+    随机改变场景中可移动物体的位置和姿态（改进版v2）
     
     参数:
         stage: USD Stage对象
     
-    功能:
-        - 吊车：只改变位置（±3米），不旋转
-        - 铲车、人物、交通锥：改变位置+姿态（绕Z轴旋转）
-        高度保持不变
+    改进:
+        1. 先放最大物体（吊车），再放其他物体
+        2. 碰撞检测使用**半径之和**（而非max），确保不重叠
+        3. 吊车使用实际BBox计算碰撞半径（吊臂可达7-8m）
+        4. 交通锥每个单独放置
+        5. 所有物体保持在原始地面高度
     """
     from pxr import UsdGeom, Gf
     
-    # 定义需要随机移动的物体及其移动范围
-    objects_to_randomize = {
-        # 路径: (x_range, y_range, z_offset_range, rotation_range_deg, rotate_enabled) 
-        "/World/GroundPlane/tn__Pk7501SLD_PNR3879_fPM": (3.0, 3.0, 0.0, 0, False),  # 吊车：只移动位置
-        "/World/GroundPlane/tn__09684481_": (3.0, 3.0, 0.0, 180.0, True),  # 铲车：位置+姿态
-        "/World/GroundPlane/DHGen": (2.0, 2.0, 0.0, 180.0, True),  # 人物：位置+姿态
-        "/World/GroundPlane/Cone001": (1.5, 1.5, 0.0, 180.0, True),  # 交通锥：位置+姿态
-    }
+    # ===== 碰撞检测工具函数 =====
+    placed_positions = []  # [(x, y, occupy_radius), ...]
+    
+    def check_no_overlap(x, y, own_radius):
+        """
+        检查新位置是否与所有已放置物体保持足够距离
+        关键修复: 使用两个物体半径之和 (own_radius + pr) 而非 max()
+        """
+        for px, py, pr in placed_positions:
+            dist = np.sqrt((x - px)**2 + (y - py)**2)
+            required_dist = own_radius + pr  # 两物体半径之和
+            if dist < required_dist:
+                return False
+        return True
+    
+    def find_valid_position(center_x, center_y, range_x, range_y, own_radius, max_attempts=80):
+        """在指定范围内寻找不重叠的随机位置"""
+        for _ in range(max_attempts):
+            x = np.random.uniform(center_x - range_x, center_x + range_x)
+            y = np.random.uniform(center_y - range_y, center_y + range_y)
+            if check_no_overlap(x, y, own_radius):
+                return x, y, True
+        # 找不到则返回中心附近随机位置（标记失败）
+        return center_x + np.random.uniform(-1, 1), center_y + np.random.uniform(-1, 1), False
+    
+    def compute_prim_xy_radius(prim, default=3.0):
+        """
+        根据BBox计算prim在XY平面上的碰撞半径
+        考虑吊车吊臂等不对称结构
+        """
+        try:
+            bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ['default', 'render'])
+            bbox = bbox_cache.ComputeWorldBound(prim)
+            bbox_range = bbox.ComputeAlignedRange()
+            min_pt = bbox_range.GetMin()
+            max_pt = bbox_range.GetMax()
+            # XY平面对角线的一半 = 碰撞半径
+            dx = (max_pt[0] - min_pt[0]) / 2.0
+            dy = (max_pt[1] - min_pt[1]) / 2.0
+            radius = np.sqrt(dx**2 + dy**2)
+            return max(radius * 0.9, 1.0)  # 90%的对角线，至少1m
+        except:
+            return default
+    
+    def set_prim_transform(prim, new_x, new_y, new_z, rotation_deg=None):
+        """设置prim的位移和绕Z轴旋转"""
+        xformable = UsdGeom.Xformable(prim)
+        if not xformable:
+            return False
+        
+        translate_op = None
+        rotate_op = None
+        for op in xformable.GetOrderedXformOps():
+            if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                translate_op = op
+            elif op.GetOpType() == UsdGeom.XformOp.TypeRotateZ:
+                rotate_op = op
+        
+        if translate_op is None:
+            translate_op = xformable.AddTranslateOp()
+        translate_op.Set(Gf.Vec3d(new_x, new_y, new_z))
+        
+        if rotation_deg is not None:
+            if rotate_op is None:
+                rotate_op = xformable.AddRotateZOp()
+            rotate_op.Set(float(rotation_deg))
+        
+        return True
+    
+    def get_prim_z(prim):
+        """获取prim当前的Z坐标（地面高度）"""
+        xformable = UsdGeom.Xformable(prim)
+        try:
+            transform = xformable.GetLocalTransformation()
+            return float(transform.ExtractTranslation()[2])
+        except:
+            return 0.0
+    
+    def find_prims_by_prefix(parent_path, prefix):
+        """查找指定父路径下所有以prefix开头的子prim"""
+        parent = stage.GetPrimAtPath(parent_path)
+        result = []
+        if parent and parent.IsValid():
+            for child in parent.GetChildren():
+                if child.GetName().startswith(prefix):
+                    result.append(child)
+        return result
     
     randomized_objects = []
+    gp_path = "/World/GroundPlane"
     
-    for prim_path, (x_range, y_range, z_range, rot_range, rotate_enabled) in objects_to_randomize.items():
-        prim = stage.GetPrimAtPath(prim_path)
+    # ===== 1. 吊车 - 最先放置（最大物体，吊臂跨度大） =====
+    crane_prims = find_prims_by_prefix(gp_path, "tn__Pk7501SLD")
+    for crane_prim in crane_prims:
+        orig_z = get_prim_z(crane_prim)
         
-        if not prim.IsValid():
-            # 尝试查找类似路径（可能有后缀）
-            parent_path = "/".join(prim_path.split("/")[:-1])
-            obj_name = prim_path.split("/")[-1]
-            parent_prim = stage.GetPrimAtPath(parent_path)
-            
-            if parent_prim.IsValid():
-                # 查找所有子对象，找到名称匹配的
-                for child in parent_prim.GetChildren():
-                    if child.GetName().startswith(obj_name):
-                        prim = child
-                        prim_path = str(child.GetPath())
-                        break
+        # 计算吊车实际碰撞半径（吊臂跨度，通常7-8m）
+        crane_radius = compute_prim_xy_radius(crane_prim, default=7.0)
+        # 吊车碰撞半径至少6m（吊臂很长）
+        crane_radius = max(crane_radius, 6.0)
         
-        if prim.IsValid():
-            xformable = UsdGeom.Xformable(prim)
-            
-            if xformable:
-                # 获取当前变换
-                try:
-                    current_transform = xformable.GetLocalTransformation()
-                    current_position = current_transform.ExtractTranslation()
-                    
-                    # 生成随机位置偏移
-                    x_offset = np.random.uniform(-x_range, x_range)
-                    y_offset = np.random.uniform(-y_range, y_range)
-                    z_offset = np.random.uniform(-z_range, z_range) if z_range > 0 else 0
-                    
-                    # 计算新位置
-                    new_x = current_position[0] + x_offset
-                    new_y = current_position[1] + y_offset
-                    new_z = current_position[2] + z_offset
-                    
-                    # 查找或创建translate操作
-                    translate_op = None
-                    rotate_op = None
-                    
-                    for op in xformable.GetOrderedXformOps():
-                        if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
-                            translate_op = op
-                        elif op.GetOpType() == UsdGeom.XformOp.TypeRotateZ:
-                            rotate_op = op
-                    
-                    # 如果没有translate操作，添加一个
-                    if translate_op is None:
-                        translate_op = xformable.AddTranslateOp()
-                    
-                    # 设置新的位置
-                    translate_op.Set(Gf.Vec3d(new_x, new_y, new_z))
-                    
-                    # 如果允许旋转，则修改旋转
-                    rotation_deg = 0
-                    if rotate_enabled and rot_range > 0:
-                        rotation_deg = np.random.uniform(-rot_range, rot_range)
-                        
-                        # 如果没有rotateZ操作，添加一个
-                        if rotate_op is None:
-                            rotate_op = xformable.AddRotateZOp()
-                        
-                        # 设置新的旋转（单位：度）
-                        rotate_op.Set(rotation_deg)
-                    
-                    randomized_objects.append({
-                        'path': prim_path,
-                        'old_pos': [current_position[0], current_position[1], current_position[2]],
-                        'new_pos': [new_x, new_y, new_z],
-                        'offset': [x_offset, y_offset, z_offset],
-                        'rotation': rotation_deg if rotate_enabled else None
-                    })
-                    
-                except Exception as e:
-                    print(f"  ⚠ 无法移动物体 {prim_path}: {str(e)}")
-        else:
-            print(f"  ⚠ 物体不存在: {prim_path}")
+        print(f"    [碰撞] 吊车BBox碰撞半径: {crane_radius:.1f}m")
+        
+        # 吊车在中心小范围移动，不旋转
+        new_x, new_y, ok = find_valid_position(0, 0, 2.0, 2.0, crane_radius)
+        
+        if set_prim_transform(crane_prim, new_x, new_y, orig_z):
+            placed_positions.append((new_x, new_y, crane_radius))
+            randomized_objects.append({
+                'path': str(crane_prim.GetPath()),
+                'new_pos': [new_x, new_y, orig_z],
+                'rotation': None,
+                'type': 'crane',
+                'no_overlap': ok
+            })
+    
+    # ===== 2. 拖车/铲车 (dumper) - 放在与吊车不重叠的位置 =====
+    dumper_areas = [
+        (-7, -1),    # 原始位置附近
+        (-3, -5),    # 下方
+        (5, 0),      # 右侧
+        (-5, 5),     # 左前方
+        (3, -4),     # 右下方
+        (6, 3),      # 右前方
+        (-6, -4),    # 左下方
+    ]
+    
+    dumper_prims = find_prims_by_prefix(gp_path, "tn__09684481")
+    for dumper_prim in dumper_prims:
+        orig_z = get_prim_z(dumper_prim)
+        
+        # 计算铲车实际碰撞半径（通常2-3m）
+        dumper_radius = compute_prim_xy_radius(dumper_prim, default=3.0)
+        dumper_radius = max(dumper_radius, 2.5)
+        
+        print(f"    [碰撞] 铲车BBox碰撞半径: {dumper_radius:.1f}m")
+        
+        # 从多个候选区域中尝试找到合法位置
+        best_pos = None
+        for area in np.random.permutation(len(dumper_areas)):
+            ax, ay = dumper_areas[int(area)]
+            new_x, new_y, ok = find_valid_position(ax, ay, 2.0, 2.0, dumper_radius)
+            if ok:
+                best_pos = (new_x, new_y, ok)
+                break
+        
+        if best_pos is None:
+            # 所有候选区域都找不到，用最远的区域强制放
+            ax, ay = dumper_areas[0]
+            new_x, new_y, ok = find_valid_position(ax, ay, 3.0, 3.0, dumper_radius)
+            best_pos = (new_x, new_y, ok)
+        
+        new_x, new_y, ok = best_pos
+        rotation = np.random.uniform(-180, 180)
+        
+        if set_prim_transform(dumper_prim, new_x, new_y, orig_z, rotation):
+            placed_positions.append((new_x, new_y, dumper_radius))
+            randomized_objects.append({
+                'path': str(dumper_prim.GetPath()),
+                'new_pos': [new_x, new_y, orig_z],
+                'rotation': rotation,
+                'type': 'dumper',
+                'no_overlap': ok
+            })
+    
+    # ===== 3. 人物 - 中等范围移动 =====
+    human_prims = find_prims_by_prefix(gp_path, "DHGen")
+    human_radius = 0.8  # 人体半径约0.8m
+    for human_prim in human_prims:
+        orig_z = get_prim_z(human_prim)
+        new_x, new_y, ok = find_valid_position(
+            np.random.uniform(-5, 5), np.random.uniform(-5, 5),
+            3.0, 3.0, human_radius
+        )
+        rotation = np.random.uniform(-180, 180)
+        
+        if set_prim_transform(human_prim, new_x, new_y, orig_z, rotation):
+            placed_positions.append((new_x, new_y, human_radius))
+            randomized_objects.append({
+                'path': str(human_prim.GetPath()),
+                'new_pos': [new_x, new_y, orig_z],
+                'rotation': rotation,
+                'type': 'human',
+                'no_overlap': ok
+            })
+    
+    # ===== 4. 交通锥 - 每个单独放置，分散在场景中 =====
+    cone_prims = find_prims_by_prefix(gp_path, "Cone001")
+    cone_radius = 0.5  # 锥筒半径约0.5m
+    
+    for cone_prim in cone_prims:
+        orig_z = get_prim_z(cone_prim)
+        cx = np.random.uniform(-7, 7)
+        cy = np.random.uniform(-7, 7)
+        new_x, new_y, ok = find_valid_position(cx, cy, 2.0, 2.0, cone_radius)
+        rotation = np.random.uniform(-180, 180)
+        
+        if set_prim_transform(cone_prim, new_x, new_y, orig_z, rotation):
+            placed_positions.append((new_x, new_y, cone_radius))
+            randomized_objects.append({
+                'path': str(cone_prim.GetPath()),
+                'new_pos': [new_x, new_y, orig_z],
+                'rotation': rotation,
+                'type': 'trafficcone',
+                'no_overlap': ok
+            })
+    
+    # 统计碰撞情况
+    overlap_count = sum(1 for obj in randomized_objects if not obj.get('no_overlap', True))
+    if overlap_count > 0:
+        print(f"  ⚠ {overlap_count} 个物体未能完全避免重叠")
+    else:
+        print(f"  ✓ 所有 {len(randomized_objects)} 个物体无碰撞")
     
     return randomized_objects
+
+
+def build_crane_part_map(stage):
+    """
+    扫描吊车层级结构，建立完整的 prim路径 -> (部件名, 类别ID) 映射
+    在初始化阶段调用一次，后续 get_object_root() 可直接查表
+    """
+    global _crane_part_map
+    _crane_part_map = {}
+    
+    crane_root_path = "/World/GroundPlane/tn__Pk7501SLD_PNR3879_fPM"
+    crane_prim = stage.GetPrimAtPath(crane_root_path)
+    if not crane_prim or not crane_prim.IsValid():
+        print(f"  ⚠ 吊车根节点不存在: {crane_root_path}")
+        return _crane_part_map
+    
+    # 遍历一级子节点
+    first_level = list(crane_prim.GetChildren())
+    print(f"  [吊车部件映射] 一级子节点: {len(first_level)} 个")
+    
+    mapped_parts = {"cranebase": 0, "cranecolumn": 0, "craneboom": 0, "cranetelescopic": 0, "crane": 0}
+    
+    for child in first_level:
+        child_name_lower = child.GetName().lower()
+        child_path = str(child.GetPath())
+        
+        # 使用已知的精确映射
+        if child_name_lower in CRANE_PART_CHILD_MAP:
+            part_name, class_id = CRANE_PART_CHILD_MAP[child_name_lower]
+        else:
+            # 未知子节点归为整体吊车
+            part_name, class_id = "crane", 3
+        
+        # 映射此子节点及所有后代
+        _crane_part_map[child_path] = (part_name, class_id)
+        for desc in Usd.PrimRange(child):
+            _crane_part_map[str(desc.GetPath())] = (part_name, class_id)
+        
+        mapped_parts[part_name] = mapped_parts.get(part_name, 0) + 1
+    
+    # 打印映射统计
+    print(f"  [吊车部件映射] 映射结果:")
+    for pname, count in mapped_parts.items():
+        if count > 0:
+            print(f"    {pname}: {count} 个一级子节点")
+    print(f"  [吊车部件映射] 共映射 {len(_crane_part_map)} 个prim路径")
+    
+    return _crane_part_map
+
+
+def fix_scene_materials(stage):
+    """
+    修复树木和交通锥的材质 - 使用OmniPBR（MDL）材质
+    
+    UsdPreviewSurface在Isaac Sim RTX渲染器中不能正确显示,
+    必须使用OmniPBR (MDL shader) 才能在RTX模式下正确渲染颜色。
+    
+    只在初始化时调用一次。
+    """
+    from pxr import UsdShade, Gf, Sdf
+    
+    # 获取场景路径，计算纹理目录
+    scene_path = stage.GetRootLayer().identifier
+    scene_dir = os.path.dirname(scene_path)         # cad_models/
+    project_dir = os.path.dirname(scene_dir)          # 项目根目录
+    textures_dir = os.path.join(project_dir, "textures")
+    
+    texture_leaves_path = os.path.join(textures_dir, "Branches0018_1_S.png")
+    texture_bark_path = os.path.join(textures_dir, "BarkDecidious0107_M.jpg")
+    texture_cone_path = os.path.join(textures_dir, "Traffic Cone UV Fixed.png")
+    
+    print(f"  纹理目录: {textures_dir}")
+    print(f"  树叶纹理: {'✓' if os.path.exists(texture_leaves_path) else '✗'}")
+    print(f"  树皮纹理: {'✓' if os.path.exists(texture_bark_path) else '✗'}")
+    print(f"  交通锥纹理: {'✓' if os.path.exists(texture_cone_path) else '✗'}")
+    
+    # 确保 /World/Looks 存在
+    if not stage.GetPrimAtPath("/World/Looks"):
+        stage.DefinePrim("/World/Looks", "Scope")
+    
+    def create_omnipbr_material(mat_path, diffuse_color, texture_path=None, roughness=0.5):
+        """
+        创建OmniPBR (MDL) 材质 - Isaac Sim RTX渲染器原生支持
+        
+        参数:
+            mat_path: 材质USD路径
+            diffuse_color: Gf.Vec3f 漫反射颜色
+            texture_path: 可选纹理文件绝对路径
+            roughness: 粗糙度
+        """
+        if stage.GetPrimAtPath(mat_path):
+            stage.RemovePrim(mat_path)
+        
+        material = UsdShade.Material.Define(stage, mat_path)
+        shader = UsdShade.Shader.Define(stage, mat_path + "/Shader")
+        
+        # === OmniPBR MDL Shader ===
+        shader.SetSourceAsset("OmniPBR.mdl", "mdl")
+        shader.SetSourceAssetSubIdentifier("OmniPBR", "mdl")
+        
+        # 设置漫反射颜色
+        shader.CreateInput("diffuse_color_constant", Sdf.ValueTypeNames.Color3f).Set(diffuse_color)
+        
+        # 设置纹理（如果有）
+        if texture_path and os.path.exists(texture_path):
+            texture_filename = os.path.basename(texture_path)
+            relative_path = f"../textures/{texture_filename}"
+            shader.CreateInput("diffuse_texture", Sdf.ValueTypeNames.Asset).Set(relative_path)
+            # 启用纹理
+            shader.CreateInput("diffuse_color_constant", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(1.0, 1.0, 1.0))
+            print(f"    OmniPBR + 纹理: {texture_filename}")
+        else:
+            print(f"    OmniPBR 纯色: RGB({diffuse_color[0]:.2f}, {diffuse_color[1]:.2f}, {diffuse_color[2]:.2f})")
+        
+        # 粗糙度和金属度
+        shader.CreateInput("reflection_roughness_constant", Sdf.ValueTypeNames.Float).Set(roughness)
+        shader.CreateInput("metallic_constant", Sdf.ValueTypeNames.Float).Set(0.0)
+        
+        # 连接MDL surface output
+        material.CreateSurfaceOutput("mdl").ConnectToSource(shader.ConnectableAPI(), "out")
+        
+        # 同时创建UsdPreviewSurface作为备用（非RTX渲染器可能用到）
+        shader_preview = UsdShade.Shader.Define(stage, mat_path + "/PreviewShader")
+        shader_preview.CreateIdAttr("UsdPreviewSurface")
+        shader_preview.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(diffuse_color)
+        shader_preview.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(roughness)
+        shader_preview.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+        material.CreateSurfaceOutput().ConnectToSource(shader_preview.ConnectableAPI(), "surface")
+        
+        return material
+    
+    # ===== 创建材质 =====
+    leaves_color = Gf.Vec3f(0.15, 0.55, 0.12)   # 绿色
+    bark_color = Gf.Vec3f(0.35, 0.22, 0.10)      # 棕色
+    cone_color = Gf.Vec3f(1.0, 0.4, 0.0)         # 橙色
+    
+    print(f"\n  创建树叶材质 (OmniPBR)...")
+    leaves_mat = create_omnipbr_material(
+        "/World/Looks/TreeLeaves", leaves_color,
+        texture_path=texture_leaves_path, roughness=0.7
+    )
+    
+    print(f"  创建树干材质 (OmniPBR)...")
+    bark_mat = create_omnipbr_material(
+        "/World/Looks/TreeBark", bark_color,
+        texture_path=texture_bark_path, roughness=0.8
+    )
+    
+    print(f"  创建交通锥材质 (OmniPBR)...")
+    cone_mat = create_omnipbr_material(
+        "/World/Looks/TrafficCone", cone_color,
+        texture_path=texture_cone_path, roughness=0.6
+    )
+    
+    # ===== 应用树木材质 =====
+    tree_parent = stage.GetPrimAtPath("/World/Tree")
+    tree_mesh_count = 0
+    if tree_parent and tree_parent.IsValid():
+        for desc in Usd.PrimRange(tree_parent):
+            if desc.IsA(UsdGeom.Mesh):
+                UsdShade.MaterialBindingAPI.Apply(desc)
+                UsdShade.MaterialBindingAPI(desc).Bind(leaves_mat)
+                
+                # 设置displayColor（确保点云颜色）
+                gprim = UsdGeom.Gprim(desc)
+                gprim.GetDisplayColorAttr().Set([leaves_color])
+                tree_mesh_count += 1
+        print(f"  ✓ 树木: {tree_mesh_count} 个Mesh 已应用绿色OmniPBR材质")
+    else:
+        print("  ⚠ 未找到 /World/Tree")
+    
+    # ===== 应用交通锥材质 =====
+    gp = stage.GetPrimAtPath("/World/GroundPlane")
+    cone_mesh_count = 0
+    cone_obj_count = 0
+    if gp and gp.IsValid():
+        for child in gp.GetChildren():
+            if child.GetName().startswith("Cone001") or "Cone" in child.GetName():
+                cone_obj_count += 1
+                for desc in Usd.PrimRange(child):
+                    if desc.IsA(UsdGeom.Mesh):
+                        UsdShade.MaterialBindingAPI.Apply(desc)
+                        UsdShade.MaterialBindingAPI(desc).Bind(cone_mat)
+                        
+                        gprim = UsdGeom.Gprim(desc)
+                        gprim.GetDisplayColorAttr().Set([cone_color])
+                        cone_mesh_count += 1
+        print(f"  ✓ 交通锥: {cone_obj_count} 个锥, {cone_mesh_count} 个Mesh 已应用橙色OmniPBR材质")
+    else:
+        print("  ⚠ 未找到 /World/GroundPlane")
+    
+    return {"tree_meshes": tree_mesh_count, "cone_meshes": cone_mesh_count}
+
+
+def setup_scene_lighting(stage):
+    """
+    设置场景光照 - 添加Dome Light（环境光/天空光）
+    
+    问题：场景只有一个方向光（太阳），背光面的物体全部纯黑，天空也是黑色。
+    解决：添加Dome Light提供360°环境照明，模拟真实天空散射光。
+    """
+    from pxr import UsdLux, Gf
+    
+    dome_path = "/World/DomeLight"
+    
+    # 检查是否已存在
+    existing = stage.GetPrimAtPath(dome_path)
+    if existing and existing.IsValid():
+        print(f"  Dome Light 已存在: {dome_path}")
+        # 确保强度合适
+        dome = UsdLux.DomeLight(existing)
+        try:
+            intensity = dome.GetIntensityAttr().Get()
+            print(f"  当前强度: {intensity}")
+            if intensity is None or intensity < 100:
+                dome.GetIntensityAttr().Set(500.0)
+                print(f"  → 已调整强度为 500")
+        except:
+            pass
+        return
+    
+    # 创建Dome Light
+    dome = UsdLux.DomeLight.Define(stage, dome_path)
+    
+    # 强度 - 足够照亮阴影面，但不过亮
+    dome.CreateIntensityAttr().Set(500.0)
+    
+    # 颜色 - 略带蓝色的天空光
+    dome.CreateColorAttr().Set(Gf.Vec3f(0.75, 0.85, 1.0))
+    
+    # 设置为可见的天空背景（不是纯黑）
+    # specular = 0.5 避免过强的环境反射
+    try:
+        dome.CreateSpecularAttr().Set(0.5)
+    except:
+        pass
+    
+    print(f"  ✓ 已创建 Dome Light: {dome_path}")
+    print(f"    强度: 500, 颜色: 天空蓝 (0.75, 0.85, 1.0)")
+    
+    # 检查并调整现有方向光（如果太强会导致对比过高）
+    for prim in stage.Traverse():
+        if prim.IsA(UsdLux.DistantLight):
+            distant = UsdLux.DistantLight(prim)
+            try:
+                intensity = distant.GetIntensityAttr().Get()
+                if intensity and intensity > 2000:
+                    distant.GetIntensityAttr().Set(1500.0)
+                    print(f"  → 降低方向光强度: {prim.GetPath()} ({intensity} → 1500)")
+            except:
+                pass
 
 
 """========== 准备工作 =========="""
@@ -1002,6 +1453,18 @@ async def generate_data():
                 print(f"    - {child.GetPath()} ({child.GetTypeName()})")
     else:
         print(f"  ⚠ /World路径不存在！")
+    
+    # 构建吊车部件映射（一次性）
+    print(f"\n[诊断] 构建吊车部件映射...")
+    crane_map = build_crane_part_map(stage)
+    
+    # 设置场景光照（添加环境光，解决背光面纯黑问题）
+    print(f"\n[诊断] 设置场景光照...")
+    setup_scene_lighting(stage)
+    
+    # 修复树木和交通锥材质（OmniPBR）
+    print(f"\n[诊断] 修复场景材质...")
+    material_results = fix_scene_materials(stage)
     
     """1. 设置相机"""
     print(f"\n[步骤1] 初始化相机...")
@@ -1125,20 +1588,23 @@ async def generate_data():
     current_iter = 0
     
     while current_iter < actual_frames:
-        # 每20帧随机改变物体位置
-        if current_iter > 0 and current_iter % 20 == 0:
-            print(f"\n[物体位置随机化] 帧 {current_iter} - 重新随机物体位置...")
+        # 每10帧随机改变物体位置和树木颜色（更频繁以增加数据多样性）
+        if current_iter > 0 and current_iter % 10 == 0:
+            print(f"\n[场景随机化] 帧 {current_iter} - 重新随机物体位置和树木颜色...")
+            
+            # 随机化物体位置（含碰撞检测）
             randomized = randomize_object_positions(stage)
             if randomized:
                 print(f"  ✓ 已随机移动 {len(randomized)} 个物体:")
                 for obj_info in randomized:
-                    offset = obj_info['offset']
+                    pos = obj_info['new_pos']
                     rotation = obj_info.get('rotation')
+                    obj_type = obj_info.get('type', '?')
                     obj_name = obj_info['path'].split('/')[-1]
                     if rotation is not None:
-                        print(f"    - {obj_name}: 位置偏移 ({offset[0]:.2f}, {offset[1]:.2f})m, 旋转 {rotation:.1f}°")
+                        print(f"    - [{obj_type}] {obj_name}: 位置 ({pos[0]:.2f}, {pos[1]:.2f})m, 旋转 {rotation:.1f}°")
                     else:
-                        print(f"    - {obj_name}: 位置偏移 ({offset[0]:.2f}, {offset[1]:.2f})m")
+                        print(f"    - [{obj_type}] {obj_name}: 位置 ({pos[0]:.2f}, {pos[1]:.2f})m")
             else:
                 print(f"  ⚠ 未能随机移动任何物体")
             
@@ -1468,8 +1934,9 @@ async def generate_data():
                     "inst_idx": inst_idx,
                     "class_id": obj_info["class_id"],
                     "class_name": obj_info["class_name"],
-                    "prim_path": object_root,  # 使用物体根路径
-                    "mesh_count": len(obj_info["mesh_paths"])  # 记录包含的Mesh数量
+                    "prim_path": object_root,  # 使用物体根路径（吊车部件含#分隔符）
+                    "mesh_count": len(obj_info["mesh_paths"]),
+                    "mesh_paths": obj_info["mesh_paths"],  # 保留mesh路径供位姿计算使用
                 })
                 inst_idx += 1
             
@@ -1507,10 +1974,14 @@ async def generate_data():
         for obj in object_list:
             prim_path = obj['prim_path']
             
+            # 处理吊车部件的虚拟聚合路径（含#分隔符）
+            # 例如: /World/.../crane_root#cranebase -> 使用其mesh_paths获取位姿
+            actual_prim_path = prim_path.split("#")[0] if "#" in prim_path else prim_path
+            
             # 方法1：尝试从bbox_3d_annotator获取
             if use_annotator:
                 try:
-                    bbox_index = bbox_prim_paths.index(prim_path)
+                    bbox_index = bbox_prim_paths.index(actual_prim_path)
                     bbox_dict = bbox_dict_list[bbox_index]
                     center, size, euler = bboxDict_to_transform(bbox_dict)
                     
@@ -1526,12 +1997,45 @@ async def generate_data():
                     pose_list.append(pose_info)
                     continue
                 except:
-                    pass  # 失败则尝试方法2
+                    pass
+                
+                # 对于吊车部件：尝试用该部件的任一mesh路径查找bbox
+                if "#" in prim_path and "mesh_paths" in obj:
+                    found = False
+                    for mesh_path in obj.get("mesh_paths", []):
+                        try:
+                            bbox_index = bbox_prim_paths.index(mesh_path)
+                            bbox_dict = bbox_dict_list[bbox_index]
+                            center, size, euler = bboxDict_to_transform(bbox_dict)
+                            pose_info = {
+                                "inst_idx": obj['inst_idx'],
+                                "class_id": obj['class_id'],
+                                "class_name": obj['class_name'],
+                                "center": center,
+                                "size": size,
+                                "rotation": euler,
+                                "prim_path": prim_path
+                            }
+                            pose_list.append(pose_info)
+                            found = True
+                            break
+                        except:
+                            continue
+                    if found:
+                        continue
             
             # 方法2：从USD prim直接获取位姿
             try:
-                prim = stage.GetPrimAtPath(prim_path)
-                if prim:
+                prim = stage.GetPrimAtPath(actual_prim_path)
+                if not prim or not prim.IsValid():
+                    # 吊车部件：尝试从mesh_paths获取第一个有效prim
+                    for mp in obj.get("mesh_paths", []):
+                        p = stage.GetPrimAtPath(mp)
+                        if p and p.IsValid():
+                            prim = p
+                            break
+                
+                if prim and prim.IsValid():
                     xform = UsdGeom.Xformable(prim)
                     if xform:
                         # 获取世界坐标变换
@@ -1544,7 +2048,7 @@ async def generate_data():
                         r_obj = R.from_matrix(rot_np)
                         euler = r_obj.as_euler('xyz', degrees=True)
                         
-                        # 简单的尺寸估计（使用包围盒）
+                        # 计算包围盒尺寸
                         try:
                             bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ['default'])
                             bbox = bbox_cache.ComputeWorldBound(prim)
@@ -1555,7 +2059,7 @@ async def generate_data():
                                 bbox_range.GetMax()[2] - bbox_range.GetMin()[2]
                             ]
                         except:
-                            size = [1.0, 1.0, 1.0]  # 默认尺寸
+                            size = [1.0, 1.0, 1.0]
                         
                         pose_info = {
                             "inst_idx": obj['inst_idx'],

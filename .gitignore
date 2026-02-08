@@ -3,8 +3,7 @@ dataset_*/
 *.csv
 *.npy
 
-# 大型资产（不入git）
-people_assets/
+# 旧树模型纹理（已替换为American_Beech）
 cad_models/tree/textures/
 cad_models/tree/Tree.usd.bak
 

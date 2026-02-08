@@ -24,3 +24,13 @@ __pycache__/
 
 # 临时文件
 *.tmp
+
+# 一次性工具脚本（不入git）
+add_crane_part_labels.py
+add_semantic_labels_v2.py
+replace_trees.py
+fix_materials.py
+fix_people_materials.py
+import_textured_models.py
+inspect_crane_structure.py
+analyze_crane_parts.py

@@ -1194,146 +1194,9 @@ def build_crane_part_map(stage):
 
 def fix_scene_materials(stage):
     """
-    修复树木和交通锥的材质 - 使用OmniPBR（MDL）材质
-    
-    UsdPreviewSurface在Isaac Sim RTX渲染器中不能正确显示,
-    必须使用OmniPBR (MDL shader) 才能在RTX模式下正确渲染颜色。
-    
-    只在初始化时调用一次。
+    树木材质已在USD源文件中修复（纹理路径已更正），无需运行时修改。
     """
-    from pxr import UsdShade, Gf, Sdf
-    
-    # 获取场景路径，计算纹理目录
-    scene_path = stage.GetRootLayer().identifier
-    scene_dir = os.path.dirname(scene_path)         # cad_models/
-    project_dir = os.path.dirname(scene_dir)          # 项目根目录
-    textures_dir = os.path.join(project_dir, "textures")
-    
-    texture_leaves_path = os.path.join(textures_dir, "Branches0018_1_S.png")
-    texture_bark_path = os.path.join(textures_dir, "BarkDecidious0107_M.jpg")
-    texture_cone_path = os.path.join(textures_dir, "Traffic Cone UV Fixed.png")
-    
-    print(f"  纹理目录: {textures_dir}")
-    print(f"  树叶纹理: {'✓' if os.path.exists(texture_leaves_path) else '✗'}")
-    print(f"  树皮纹理: {'✓' if os.path.exists(texture_bark_path) else '✗'}")
-    print(f"  交通锥纹理: {'✓' if os.path.exists(texture_cone_path) else '✗'}")
-    
-    # 确保 /World/Looks 存在
-    if not stage.GetPrimAtPath("/World/Looks"):
-        stage.DefinePrim("/World/Looks", "Scope")
-    
-    def create_omnipbr_material(mat_path, diffuse_color, texture_path=None, roughness=0.5):
-        """
-        创建OmniPBR (MDL) 材质 - Isaac Sim RTX渲染器原生支持
-        
-        参数:
-            mat_path: 材质USD路径
-            diffuse_color: Gf.Vec3f 漫反射颜色
-            texture_path: 可选纹理文件绝对路径
-            roughness: 粗糙度
-        """
-        if stage.GetPrimAtPath(mat_path):
-            stage.RemovePrim(mat_path)
-        
-        material = UsdShade.Material.Define(stage, mat_path)
-        shader = UsdShade.Shader.Define(stage, mat_path + "/Shader")
-        
-        # === OmniPBR MDL Shader ===
-        shader.SetSourceAsset("OmniPBR.mdl", "mdl")
-        shader.SetSourceAssetSubIdentifier("OmniPBR", "mdl")
-        
-        # 设置漫反射颜色
-        shader.CreateInput("diffuse_color_constant", Sdf.ValueTypeNames.Color3f).Set(diffuse_color)
-        
-        # 设置纹理（如果有）
-        if texture_path and os.path.exists(texture_path):
-            texture_filename = os.path.basename(texture_path)
-            relative_path = f"../textures/{texture_filename}"
-            shader.CreateInput("diffuse_texture", Sdf.ValueTypeNames.Asset).Set(relative_path)
-            # 启用纹理
-            shader.CreateInput("diffuse_color_constant", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(1.0, 1.0, 1.0))
-            print(f"    OmniPBR + 纹理: {texture_filename}")
-        else:
-            print(f"    OmniPBR 纯色: RGB({diffuse_color[0]:.2f}, {diffuse_color[1]:.2f}, {diffuse_color[2]:.2f})")
-        
-        # 粗糙度和金属度
-        shader.CreateInput("reflection_roughness_constant", Sdf.ValueTypeNames.Float).Set(roughness)
-        shader.CreateInput("metallic_constant", Sdf.ValueTypeNames.Float).Set(0.0)
-        
-        # 连接MDL surface output
-        material.CreateSurfaceOutput("mdl").ConnectToSource(shader.ConnectableAPI(), "out")
-        
-        # 同时创建UsdPreviewSurface作为备用（非RTX渲染器可能用到）
-        shader_preview = UsdShade.Shader.Define(stage, mat_path + "/PreviewShader")
-        shader_preview.CreateIdAttr("UsdPreviewSurface")
-        shader_preview.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(diffuse_color)
-        shader_preview.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(roughness)
-        shader_preview.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
-        material.CreateSurfaceOutput().ConnectToSource(shader_preview.ConnectableAPI(), "surface")
-        
-        return material
-    
-    # ===== 创建材质 =====
-    leaves_color = Gf.Vec3f(0.15, 0.55, 0.12)   # 绿色
-    bark_color = Gf.Vec3f(0.35, 0.22, 0.10)      # 棕色
-    cone_color = Gf.Vec3f(1.0, 0.4, 0.0)         # 橙色
-    
-    print(f"\n  创建树叶材质 (OmniPBR)...")
-    leaves_mat = create_omnipbr_material(
-        "/World/Looks/TreeLeaves", leaves_color,
-        texture_path=texture_leaves_path, roughness=0.7
-    )
-    
-    print(f"  创建树干材质 (OmniPBR)...")
-    bark_mat = create_omnipbr_material(
-        "/World/Looks/TreeBark", bark_color,
-        texture_path=texture_bark_path, roughness=0.8
-    )
-    
-    print(f"  创建交通锥材质 (OmniPBR)...")
-    cone_mat = create_omnipbr_material(
-        "/World/Looks/TrafficCone", cone_color,
-        texture_path=texture_cone_path, roughness=0.6
-    )
-    
-    # ===== 应用树木材质 =====
-    tree_parent = stage.GetPrimAtPath("/World/Tree")
-    tree_mesh_count = 0
-    if tree_parent and tree_parent.IsValid():
-        for desc in Usd.PrimRange(tree_parent):
-            if desc.IsA(UsdGeom.Mesh):
-                UsdShade.MaterialBindingAPI.Apply(desc)
-                UsdShade.MaterialBindingAPI(desc).Bind(leaves_mat)
-                
-                # 设置displayColor（确保点云颜色）
-                gprim = UsdGeom.Gprim(desc)
-                gprim.GetDisplayColorAttr().Set([leaves_color])
-                tree_mesh_count += 1
-        print(f"  ✓ 树木: {tree_mesh_count} 个Mesh 已应用绿色OmniPBR材质")
-    else:
-        print("  ⚠ 未找到 /World/Tree")
-    
-    # ===== 应用交通锥材质 =====
-    gp = stage.GetPrimAtPath("/World/GroundPlane")
-    cone_mesh_count = 0
-    cone_obj_count = 0
-    if gp and gp.IsValid():
-        for child in gp.GetChildren():
-            if child.GetName().startswith("Cone001") or "Cone" in child.GetName():
-                cone_obj_count += 1
-                for desc in Usd.PrimRange(child):
-                    if desc.IsA(UsdGeom.Mesh):
-                        UsdShade.MaterialBindingAPI.Apply(desc)
-                        UsdShade.MaterialBindingAPI(desc).Bind(cone_mat)
-                        
-                        gprim = UsdGeom.Gprim(desc)
-                        gprim.GetDisplayColorAttr().Set([cone_color])
-                        cone_mesh_count += 1
-        print(f"  ✓ 交通锥: {cone_obj_count} 个锥, {cone_mesh_count} 个Mesh 已应用橙色OmniPBR材质")
-    else:
-        print("  ⚠ 未找到 /World/GroundPlane")
-    
-    return {"tree_meshes": tree_mesh_count, "cone_meshes": cone_mesh_count}
+    print("  ✓ 树木: 使用原始纹理（bark_0004.jpg + DB2X2_L01.png）")
 
 
 def setup_scene_lighting(stage):
@@ -1462,9 +1325,9 @@ async def generate_data():
     print(f"\n[诊断] 设置场景光照...")
     setup_scene_lighting(stage)
     
-    # 修复树木和交通锥材质（OmniPBR）
-    print(f"\n[诊断] 修复场景材质...")
-    material_results = fix_scene_materials(stage)
+    # 树木保留原始纹理，不做修改
+    print(f"\n[诊断] 场景材质检查...")
+    fix_scene_materials(stage)
     
     """1. 设置相机"""
     print(f"\n[步骤1] 初始化相机...")

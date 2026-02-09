@@ -913,7 +913,7 @@ def get_systematic_camera_positions(num_frames=20):
 
 def randomize_object_positions(stage):
     """
-    随机改变场景中可移动物体的位置和姿态（改进版v2）
+    随机改变场景中可移动物体的位置和姿态（改进版v3）
     
     参数:
         stage: USD Stage对象
@@ -924,8 +924,21 @@ def randomize_object_positions(stage):
         3. 吊车使用实际BBox计算碰撞半径（吊臂可达7-8m）
         4. 交通锥每个单独放置
         5. 所有物体保持在原始地面高度
+        6. 栅栏边界约束：防止物体跑到栅栏外面
+        7. 吊车和人物增大移动幅度
     """
     from pxr import UsdGeom, Gf
+    
+    # ===== 栅栏边界约束 =====
+    # 树在栅栏外侧 (x: -13~11.5, y: -13.3~12.9)
+    # 栅栏内侧安全区域（留1.5m余量防止物体紧贴栅栏）
+    FENCE_X_MIN, FENCE_X_MAX = -9.0, 8.5
+    FENCE_Y_MIN, FENCE_Y_MAX = -9.0, 9.0
+    
+    def is_within_fence(x, y, margin=0.0):
+        """检查位置是否在栅栏边界内（可附加额外margin）"""
+        return (FENCE_X_MIN + margin <= x <= FENCE_X_MAX - margin and
+                FENCE_Y_MIN + margin <= y <= FENCE_Y_MAX - margin)
     
     # ===== 碰撞检测工具函数 =====
     placed_positions = []  # [(x, y, occupy_radius), ...]
@@ -942,15 +955,18 @@ def randomize_object_positions(stage):
                 return False
         return True
     
-    def find_valid_position(center_x, center_y, range_x, range_y, own_radius, max_attempts=80):
-        """在指定范围内寻找不重叠的随机位置"""
+    def find_valid_position(center_x, center_y, range_x, range_y, own_radius, max_attempts=80, fence_margin=0.5):
+        """在指定范围内寻找不重叠且在栅栏内的随机位置"""
         for _ in range(max_attempts):
             x = np.random.uniform(center_x - range_x, center_x + range_x)
             y = np.random.uniform(center_y - range_y, center_y + range_y)
-            if check_no_overlap(x, y, own_radius):
+            # 同时检查：不重叠 + 在栅栏内
+            if is_within_fence(x, y, margin=fence_margin) and check_no_overlap(x, y, own_radius):
                 return x, y, True
-        # 找不到则返回中心附近随机位置（标记失败）
-        return center_x + np.random.uniform(-1, 1), center_y + np.random.uniform(-1, 1), False
+        # 找不到则返回中心附近随机位置（钳位到栅栏内）
+        fallback_x = np.clip(center_x + np.random.uniform(-1, 1), FENCE_X_MIN + fence_margin, FENCE_X_MAX - fence_margin)
+        fallback_y = np.clip(center_y + np.random.uniform(-1, 1), FENCE_Y_MIN + fence_margin, FENCE_Y_MAX - fence_margin)
+        return fallback_x, fallback_y, False
     
     def compute_prim_xy_radius(prim, default=3.0):
         """
@@ -972,38 +988,85 @@ def randomize_object_positions(stage):
             return default
     
     def set_prim_transform(prim, new_x, new_y, new_z, rotation_deg=None):
-        """设置prim的位移和绕Z轴旋转"""
+        """
+        设置prim的位移和绕Z轴旋转（鲁棒版v2）
+        
+        策略：
+        - 情况A：如果有独立的 TypeTranslate op → 直接修改该op的值
+        - 情况B：如果用的是 TypeTransform (4x4矩阵) → 直接修改矩阵中的平移部分
+        - 这样不会破坏原始的缩放、旋转等信息
+        """
         xformable = UsdGeom.Xformable(prim)
         if not xformable:
             return False
         
+        prim_name = prim.GetName()
+        ordered_ops = xformable.GetOrderedXformOps()
+        op_types = [op.GetOpType() for op in ordered_ops]
+        
+        # 查找各类型的op
         translate_op = None
-        rotate_op = None
-        for op in xformable.GetOrderedXformOps():
+        rotate_z_op = None
+        transform_op = None  # 4x4矩阵
+        
+        for op in ordered_ops:
             if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
                 translate_op = op
             elif op.GetOpType() == UsdGeom.XformOp.TypeRotateZ:
-                rotate_op = op
+                rotate_z_op = op
+            elif op.GetOpType() == UsdGeom.XformOp.TypeTransform:
+                transform_op = op
         
-        if translate_op is None:
+        # ===== 情况B：4x4矩阵变换 → 直接改矩阵中的平移分量 =====
+        if transform_op is not None:
+            mat = transform_op.GetOpTransform(Usd.TimeCode.Default())
+            # 构建新矩阵：保留旋转和缩放，只改平移
+            new_mat = Gf.Matrix4d(mat)
+            new_mat.SetRow(3, Gf.Vec4d(new_x, new_y, new_z, 1.0))
+            transform_op.Set(new_mat, Usd.TimeCode.Default())
+            
+            print(f"      [变换-矩阵] {prim_name}: 修改4x4矩阵平移 → ({new_x:.2f}, {new_y:.2f}, {new_z:.2f})")
+            
+            # 旋转：对于4x4矩阵模式，如果需要旋转则额外添加/修改RotateZ
+            if rotation_deg is not None:
+                if rotate_z_op is None:
+                    rotate_z_op = xformable.AddRotateZOp()
+                rotate_z_op.Set(float(rotation_deg))
+            
+            return True
+        
+        # ===== 情况A：独立ops模式 → 直接修改translate op =====
+        if translate_op is not None:
+            translate_op.Set(Gf.Vec3d(new_x, new_y, new_z))
+        else:
+            # 没有任何已知的变换op，添加新的
             translate_op = xformable.AddTranslateOp()
-        translate_op.Set(Gf.Vec3d(new_x, new_y, new_z))
+            translate_op.Set(Gf.Vec3d(new_x, new_y, new_z))
         
         if rotation_deg is not None:
-            if rotate_op is None:
-                rotate_op = xformable.AddRotateZOp()
-            rotate_op.Set(float(rotation_deg))
+            if rotate_z_op is None:
+                rotate_z_op = xformable.AddRotateZOp()
+            rotate_z_op.Set(float(rotation_deg))
+        
+        print(f"      [变换-ops] {prim_name}: ops={op_types} → ({new_x:.2f}, {new_y:.2f}, {new_z:.2f})")
         
         return True
     
     def get_prim_z(prim):
-        """获取prim当前的Z坐标（地面高度）"""
+        """获取prim当前的Z坐标（地面高度）- 支持各种变换类型"""
         xformable = UsdGeom.Xformable(prim)
         try:
+            # 优先从本地变换矩阵提取（兼容4x4矩阵和独立ops）
             transform = xformable.GetLocalTransformation()
-            return float(transform.ExtractTranslation()[2])
+            z = float(transform.ExtractTranslation()[2])
+            return z
         except:
-            return 0.0
+            # 备用：尝试从世界坐标获取
+            try:
+                world_mat = xformable.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+                return float(world_mat.ExtractTranslation()[2])
+            except:
+                return 0.0
     
     def find_prims_by_prefix(parent_path, prefix):
         """查找指定父路径下所有以prefix开头的子prim"""
@@ -1030,8 +1093,8 @@ def randomize_object_positions(stage):
         
         print(f"    [碰撞] 吊车BBox碰撞半径: {crane_radius:.1f}m")
         
-        # 吊车在中心小范围移动，不旋转
-        new_x, new_y, ok = find_valid_position(0, 0, 2.0, 2.0, crane_radius)
+        # 吊车在中心范围移动（增大幅度，±4m），不旋转
+        new_x, new_y, ok = find_valid_position(0, 0, 4.0, 4.0, crane_radius)
         
         if set_prim_transform(crane_prim, new_x, new_y, orig_z):
             placed_positions.append((new_x, new_y, crane_radius))
@@ -1092,18 +1155,41 @@ def randomize_object_positions(stage):
                 'no_overlap': ok
             })
     
-    # ===== 3. 人物 - 中等范围移动 =====
+    # ===== 3. 人物 - 较大范围移动（增大幅度以增加多样性） =====
+    # 人物模型结构: DHGen (Xform) -> SkelRoot (骨骼根) -> Mesh/Skeleton
+    # 必须同时移动DHGen和SkelRoot，否则骨骼角色不会跟着动
     human_prims = find_prims_by_prefix(gp_path, "DHGen")
     human_radius = 0.8  # 人体半径约0.8m
+    
+    print(f"    [人物] 找到 {len(human_prims)} 个人物prim")
+    
     for human_prim in human_prims:
         orig_z = get_prim_z(human_prim)
         new_x, new_y, ok = find_valid_position(
-            np.random.uniform(-5, 5), np.random.uniform(-5, 5),
-            3.0, 3.0, human_radius
+            np.random.uniform(-7, 7), np.random.uniform(-7, 7),
+            4.0, 4.0, human_radius
         )
         rotation = np.random.uniform(-180, 180)
         
-        if set_prim_transform(human_prim, new_x, new_y, orig_z, rotation):
+        # 移动DHGen本身
+        moved = set_prim_transform(human_prim, new_x, new_y, orig_z, rotation)
+        
+        # 关键：同时移动所有子节点（SkelRoot等），它们可能有自己的独立变换
+        for child in human_prim.GetChildren():
+            child_name = child.GetName()
+            child_type = child.GetTypeName()
+            child_xformable = UsdGeom.Xformable(child)
+            
+            if child_xformable:
+                child_ops = [op.GetOpType() for op in child_xformable.GetOrderedXformOps()]
+                print(f"      [人物子节点] {child_name} (类型:{child_type}), xform ops: {child_ops}")
+                
+                # 如果子节点有自己的变换，也需要更新
+                if len(child_ops) > 0:
+                    set_prim_transform(child, new_x, new_y, orig_z, rotation)
+                    moved = True
+        
+        if moved:
             placed_positions.append((new_x, new_y, human_radius))
             randomized_objects.append({
                 'path': str(human_prim.GetPath()),
@@ -1113,15 +1199,16 @@ def randomize_object_positions(stage):
                 'no_overlap': ok
             })
     
-    # ===== 4. 交通锥 - 每个单独放置，分散在场景中 =====
+    # ===== 4. 交通锥 - 每个单独放置，严格限制在栅栏内 =====
     cone_prims = find_prims_by_prefix(gp_path, "Cone001")
     cone_radius = 0.5  # 锥筒半径约0.5m
     
     for cone_prim in cone_prims:
         orig_z = get_prim_z(cone_prim)
-        cx = np.random.uniform(-7, 7)
-        cy = np.random.uniform(-7, 7)
-        new_x, new_y, ok = find_valid_position(cx, cy, 2.0, 2.0, cone_radius)
+        # 缩小锥筒随机中心范围，防止跑到栅栏外面
+        cx = np.random.uniform(-6, 6)
+        cy = np.random.uniform(-6, 6)
+        new_x, new_y, ok = find_valid_position(cx, cy, 2.0, 2.0, cone_radius, fence_margin=1.0)
         rotation = np.random.uniform(-180, 180)
         
         if set_prim_transform(cone_prim, new_x, new_y, orig_z, rotation):
